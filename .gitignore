@@ -1,0 +1,58 @@
+# --------------------
+# Project-specific
+# --------------------
+
+# Data directories
+data/
+**/data/
+
+# Files and folders starting with underscore
+_*
+**/_*
+
+# Init-related artifacts (keep __init__.py if needed)
+__pycache__/
+*.py[cod]
+
+# --------------------
+# Python
+# --------------------
+
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Allow specific files
+!__init__.py
+!**/__init__.py
