@@ -2,7 +2,7 @@ import time
 import random
 import numpy as np
 
-from env.snapshot_state import (
+from engine.snapshot_state import (
     EnvStateSnapshot,
     snapshot_from_runtime_dict,
     SNAPSHOT_SCHEMA_VERSION,

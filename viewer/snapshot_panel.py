@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
 
 from viewer.event_bus import EventBus
-from env.snapshot_state import EnvStateSnapshot
+from engine.snapshot_state import EnvStateSnapshot
 
 
 class SnapshotPanel(QWidget):

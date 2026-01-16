@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeyEvent
 
 from viewer.event_bus import EventBus
-from env.env_renderer import WORLD_MIN, WORLD_MAX
+from engine.env_renderer import WORLD_MIN, WORLD_MAX
 
 
 class LiveEnvPanel(QWidget):

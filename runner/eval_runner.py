@@ -5,12 +5,12 @@ from __future__ import annotations
 from typing import Optional, Callable, Dict, Any
 
 from viewer.event_bus import EventBus
-from env.injection_bridge import InjectionBridge
-from env.environment_runtime import EnvironmentRuntime
-from env.snapshot_state import EnvStateSnapshot
+from engine.injection_bridge import InjectionBridge
+from engine.environment_runtime import EnvironmentRuntime
+from engine.snapshot_state import EnvStateSnapshot
 from agent.agent_controller import AgentController
 from agent.logging_agent import LoggingAgent
-from env.env_renderer import EnvRenderer
+from engine.env_renderer import EnvRenderer
 from runner.observation_builder import build_observation
 
 from dataset.session_store import SessionStore

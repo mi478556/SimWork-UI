@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataset.session_types import SessionData, SessionMeta
 from dataset.clip_index import ClipIndex
 
-from env.snapshot_state import (
+from engine.snapshot_state import (
     SnapshotState,
     SNAPSHOT_SCHEMA_VERSION,
     validate_snapshot,

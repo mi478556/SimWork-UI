@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, Tuple
 
 from agent.policy_base import Observation, AgentPolicy
 from agent.execution_context import AgentExecutionContext
-from env.snapshot_state import EnvStateSnapshot
+from engine.snapshot_state import EnvStateSnapshot
 
 
 def validate_observation_contract(obs: Observation):

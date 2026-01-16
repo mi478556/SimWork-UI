@@ -25,9 +25,9 @@ from typing import Dict, Any
 import numpy as np
 
 from viewer.event_bus import EventBus
-from env.environment_runtime import EnvironmentRuntime
-from env.snapshot_state import snapshot_to_runtime_dict
-from env.injection_bridge import InjectionBridge
+from engine.environment_runtime import EnvironmentRuntime
+from engine.snapshot_state import snapshot_to_runtime_dict
+from engine.injection_bridge import InjectionBridge
 from agent.agent_controller import AgentController
 
 from runner.live_runner import LiveRunner
@@ -35,6 +35,7 @@ from runner.playback_runner import PlaybackRunner
 from runner.eval_runner import EvalRunner
 from runner.observation_builder import build_observation
 
+ 
 from viewer.trace_browser_panel import TraceBrowserPanel
 from viewer.trace_player_panel import TracePlayerPanel
 from viewer.snapshot_panel import SnapshotPanel
@@ -883,10 +884,11 @@ class AppController(QMainWindow):
         if self.current_mode == "playback":
             return
 
-        # Build observation via LiveRunner's renderer
+        # Build observation via LiveRunner's agent renderer (strict)
         snapshot = self.env.snapshot_state()
+        agent_renderer = self.live_runner.agent_renderer
         try:
-            frame = self.live_runner.renderer.render(snapshot)
+            frame = agent_renderer.render(snapshot)
         except Exception:
             frame = None
 
@@ -1011,11 +1013,8 @@ class AppController(QMainWindow):
         """Create and publish an EnvRenderPacket from the authoritative runtime state."""
         snap = self.env.snapshot_state()
 
-        # Prefer the same renderer instance LiveRunner uses
-        renderer = getattr(self.live_runner, "renderer", None)
-        if renderer is None:
-            from env.env_renderer import EnvRenderer
-            renderer = EnvRenderer()
+        # Use the runner's configured UI renderer (strict)
+        renderer = self.live_runner.ui_renderer
 
         # Always produce a frame. Never publish frame=None.
         try:
