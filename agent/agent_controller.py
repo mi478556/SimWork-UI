@@ -1,3 +1,5 @@
+# agent_controller.py
+
 from typing import Dict, Any, Optional, Tuple
 
 from agent.policy_base import Observation
@@ -10,9 +12,11 @@ class AgentController:
 
     def __init__(
         self,
+        policy: Optional[Any] = None,
         logging_agent: Optional[LoggingAgent] = None,
         tools: Optional[Dict[str, Any]] = None,
     ):
+        self.policy = policy
         self.logging_agent = logging_agent
         self.tools = tools or {}
 
@@ -97,6 +101,24 @@ class AgentController:
 
     def run_step(self, observation: Observation):
 
+
+        if self.policy is not None:
+            try:
+                action, oracle_query = self.policy.act(observation, self.tools)
+            except Exception:
+                return [0.0, 0.0], None
+
+            if oracle_query is None:
+                return action, None
+
+            qa, qb = oracle_query
+            if "distance" in self.tools:
+                try:
+                    dist = self.tools["distance"].query(qa, qb)
+                except Exception:
+                    dist = None
+                return action, dist
+            return action, None
 
         if self.logging_agent is not None and hasattr(self.logging_agent, "base_agent"):
             try:

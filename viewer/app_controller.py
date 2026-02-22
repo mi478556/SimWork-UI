@@ -28,7 +28,9 @@ from viewer.event_bus import EventBus
 from engine.environment_runtime import EnvironmentRuntime
 from engine.snapshot_state import snapshot_to_runtime_dict
 from engine.injection_bridge import InjectionBridge
+from engine.oracle_tools import EnvDistanceTool
 from agent.agent_controller import AgentController
+from agent.starter_policy import StarterWanderPolicy
 
 from runner.live_runner import LiveRunner
 from runner.playback_runner import PlaybackRunner
@@ -84,7 +86,10 @@ class AppController(QMainWindow):
         # Ensure TakeCaptured events from EventBus are marshalled onto Qt thread
         self.take_captured_qt.connect(self._on_take_captured_qt)
 
-        self.agent_controller = AgentController()
+        self.agent_controller = AgentController(
+            policy=StarterWanderPolicy(),
+            tools={"distance": EnvDistanceTool(self.env)},
+        )
 
         self.live_runner = LiveRunner(
             env=self.env,
@@ -907,6 +912,7 @@ class AppController(QMainWindow):
 
                                                            
     def _on_playback_select(self, payload):
+        print(f"[AppController] _on_playback_select: session={payload.get('session_id')} clip={payload.get('clip_id')}")
         self.playback_runner.load_clip(
             payload["session_id"],
             payload["clip_id"]
@@ -926,7 +932,7 @@ class AppController(QMainWindow):
             snapshot = payload["snapshot"]
         else:
                                        
-            snapshot = self.trace_store.get_step_snapshot(
+            snapshot = self.store.get_step_snapshot(
                 payload.get("session_id"),
                 payload.get("step_index"),
             )

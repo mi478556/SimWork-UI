@@ -111,6 +111,9 @@ class SessionPreviewPanel(QWidget):
         self.thumb_cache = ThumbnailCache(self.store, max_items=48)
         self.thumb_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
 
+        # Listen for render packets so playback frames can be shown
+        self.bus.subscribe("EnvRenderPacket", self._on_env_render_packet)
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         # --------------------------------------------------
@@ -289,6 +292,56 @@ class SessionPreviewPanel(QWidget):
 
         if abs(idx - self.index) <= 1:
             self._update_view()
+
+    def _frame_to_qimage(self, frame: np.ndarray) -> Optional[QImage]:
+        """Convert float32 [0,1] RGB numpy frame to a QImage (RGB888).
+
+        Returns a copied QImage to avoid lifetime issues with the numpy buffer.
+        """
+        if frame is None:
+            return None
+
+        if not isinstance(frame, np.ndarray):
+            return None
+
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return None
+
+        # frame is float32 [0,1]
+        img = np.clip(frame, 0.0, 1.0)
+        img = (img * 255.0).astype(np.uint8)
+        img = np.ascontiguousarray(img)
+
+        h, w, _ = img.shape
+        bytes_per_line = img.strides[0]
+
+        # copy() is critical to avoid lifetime issues
+        return QImage(
+            img.data,
+            w,
+            h,
+            bytes_per_line,
+            QImage.Format.Format_RGB888,
+        ).copy()
+
+    def _on_env_render_packet(self, packet):
+        # Expect an EnvRenderPacket dict with a `frame` key
+        if not isinstance(packet, dict):
+            return
+
+        # Debug: trace incoming packets to ensure playback frames flow
+        # print(f"[SessionPreviewPanel] EnvRenderPacket received: sim_time={packet.get('sim_time')} step_index={packet.get('step_index')} frame_present={packet.get('frame') is not None}")
+
+        frame = packet.get("frame")
+        if frame is None:
+            return
+
+        qimg = self._frame_to_qimage(frame)
+        if qimg is None:
+            return
+
+        # Playback replaces the center slot
+        self.curr_img.set_image(qimg)
 
     # --------------------------------------------------
     # Focus handling
