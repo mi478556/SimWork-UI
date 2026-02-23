@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QToolBar,
     QPushButton,
+    QComboBox,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -30,7 +31,8 @@ from engine.snapshot_state import snapshot_to_runtime_dict
 from engine.injection_bridge import InjectionBridge
 from engine.oracle_tools import EnvDistanceTool
 from agent.agent_controller import AgentController
-from agent.starter_policy import StarterWanderPolicy
+from agent.starter_policy import StarterWanderPolicy, NoOpPolicy, OscillatingPolicy
+from agent.rl_actor_critic_policy import RLActorCriticFoodPolicy
 
 from runner.live_runner import LiveRunner
 from runner.playback_runner import PlaybackRunner
@@ -43,6 +45,7 @@ from viewer.trace_player_panel import TracePlayerPanel
 from viewer.snapshot_panel import SnapshotPanel
 from viewer.live_env_panel import LiveEnvPanel
 from viewer.session_preview_panel import SessionPreviewPanel
+from viewer.rl_training_panel import RLTrainingPanel
 
 from dataset.session_store import SessionStore
 from dataset.finalize_manager import FinalizeManager
@@ -72,6 +75,7 @@ class AppController(QMainWindow):
 
         here = os.path.dirname(os.path.abspath(__file__))   # viewer/
         repo_root = os.path.dirname(here)                   # project root
+        self.repo_root = repo_root
         data_root = os.path.join(repo_root, "data")
 
         self.store = SessionStore(data_root)
@@ -87,9 +91,28 @@ class AppController(QMainWindow):
         self.take_captured_qt.connect(self._on_take_captured_qt)
 
         self.agent_controller = AgentController(
-            policy=StarterWanderPolicy(),
+            policies={
+                "Wander": StarterWanderPolicy(),
+                "Oscillate": OscillatingPolicy(),
+                "NoOp": NoOpPolicy(),
+                "RL agent": RLActorCriticFoodPolicy(),
+            },
+            active_policy_name="RL agent",
             tools={"distance": EnvDistanceTool(self.env)},
         )
+        self.rl_checkpoint_path = os.path.join(data_root, "checkpoints", "rl_agent_latest.pt")
+        self.rl_training_enabled = False
+        self.rl_episode_count = 0
+        self.rl_steps_in_episode = 0
+        self.rl_total_steps = 0
+        self.rl_autosave_every = 20
+        self.rl_max_episode_steps = 1000
+        self._rl_last_step_seen = 0
+        self.rl_last_autosave_episode = 0
+        self.rl_training_start_time = None
+        self.rl_episode_rewards = []
+        self.rl_episode_steps_history = []
+        self.rl_stop_reasons = {"phase_transition": 0, "death": 0, "max_steps": 0}
 
         self.live_runner = LiveRunner(
             env=self.env,
@@ -179,6 +202,30 @@ class AppController(QMainWindow):
         )
         self.toolbar.addWidget(self.edit_mode_btn)
 
+        self.toolbar.addSeparator()
+        self.agent_selector = QComboBox()
+        self.agent_selector.setMinimumWidth(140)
+        self.agent_selector.addItems(self.agent_controller.list_policies())
+        if self.agent_controller.active_policy_name is not None:
+            self.agent_selector.setCurrentText(self.agent_controller.active_policy_name)
+        self.agent_selector.currentTextChanged.connect(
+            lambda name: self.bus.publish("AgentPolicyRequested", {"name": name})
+        )
+        self.toolbar.addWidget(self.agent_selector)
+
+        self.train_rl_btn = QPushButton("Train RL")
+        self.train_rl_btn.setCheckable(True)
+        self.train_rl_btn.clicked.connect(self._on_train_rl_toggled)
+        self.toolbar.addWidget(self.train_rl_btn)
+
+        self.save_rl_btn = QPushButton("Save RL")
+        self.save_rl_btn.clicked.connect(lambda: self._save_rl_checkpoint(auto=False))
+        self.toolbar.addWidget(self.save_rl_btn)
+
+        self.load_rl_btn = QPushButton("Load RL")
+        self.load_rl_btn.clicked.connect(self._load_rl_checkpoint)
+        self.toolbar.addWidget(self.load_rl_btn)
+
         self.play_control_btn = QPushButton("Play")
         self.play_control_btn.setCheckable(True)
         self.pause_control_btn = QPushButton("Pause")
@@ -250,9 +297,13 @@ class AppController(QMainWindow):
             store=self.store,
             bus=self.bus,
         )
+        self.rl_training_panel = RLTrainingPanel()
+        self.rl_training_panel.set_max_episode_steps(self.rl_max_episode_steps)
+        self.rl_training_panel.max_steps_spin.valueChanged.connect(self._on_rl_max_steps_changed)
 
         self.viewport.addWidget(self.live_env_panel)        # index 0
         self.viewport.addWidget(self.session_preview_panel) # index 1
+        self.viewport.addWidget(self.rl_training_panel)     # index 2
 
         self.viewport.setCurrentWidget(self.live_env_panel)
 
@@ -303,6 +354,7 @@ class AppController(QMainWindow):
         self.bus.subscribe("PauseRequested", self._on_pause_requested)
         self.bus.subscribe("EditModeRequested", self._on_edit_mode_requested)
         self.bus.subscribe("HumanModeRequested", self._on_human_mode_requested)
+        self.bus.subscribe("AgentPolicyRequested", self._on_agent_policy_requested)
         # UI should disable edit mode while human control is active
         self.bus.subscribe("HumanAsAgentToggled", self._on_human_control_toggled)
         self.bus.subscribe("RecordMark", self._on_record_mark)
@@ -411,7 +463,10 @@ class AppController(QMainWindow):
         # Viewport switching: live/eval show live view, playback shows session preview
         try:
             if mode == "live" or mode == "eval":
-                self._show_live_view()
+                if mode == "live" and self.rl_training_enabled:
+                    self._show_rl_training_view()
+                else:
+                    self._show_live_view()
             elif mode == "playback":
                 self._show_session_preview()
         except Exception:
@@ -419,6 +474,8 @@ class AppController(QMainWindow):
 
         # Leaving live mode must always stop capture immediately
         if mode != "live":
+            if getattr(self, "rl_training_enabled", False):
+                self._set_rl_training(False)
             try:
                 if self.record_intent == self.REC_CAPTURING:
                     self.bus.publish("CaptureStopRequested", {})
@@ -518,6 +575,289 @@ class AppController(QMainWindow):
             pass
         # publish the legacy toggle for downstream consumers
         self.bus.publish("HumanAsAgentToggled", {"enabled": enabled})
+
+    def _on_agent_policy_requested(self, payload):
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return
+
+        if self.rl_training_enabled and name != "RL agent":
+            self._set_rl_training(False)
+            self._notify_user("RL training stopped because active policy changed.")
+
+        if not self.agent_controller.set_active_policy(name):
+            self._notify_user(f"Unknown agent policy: {name}")
+            return
+
+        try:
+            self.agent_selector.blockSignals(True)
+            self.agent_selector.setCurrentText(name)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.agent_selector.blockSignals(False)
+            except Exception:
+                pass
+
+        try:
+            self.bus.publish("AgentPolicyChanged", {"name": name})
+        except Exception:
+            pass
+
+    def _get_rl_policy(self):
+        policy = self.agent_controller.policies.get("RL agent")
+        if policy is None:
+            self._notify_user("RL agent policy is not registered.")
+            return None
+        return policy
+
+    def _set_agent_selector_text(self, name: str):
+        try:
+            self.agent_selector.blockSignals(True)
+            self.agent_selector.setCurrentText(name)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.agent_selector.blockSignals(False)
+            except Exception:
+                pass
+
+    def _set_rl_training(self, enabled: bool):
+        self.rl_training_enabled = bool(enabled)
+        try:
+            self.train_rl_btn.blockSignals(True)
+            self.train_rl_btn.setChecked(self.rl_training_enabled)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.train_rl_btn.blockSignals(False)
+            except Exception:
+                pass
+        # Training mode runs with no fixed GUI tick interval.
+        try:
+            self.timer.start(0 if self.rl_training_enabled else 16)
+        except Exception:
+            pass
+        if self.rl_training_enabled and self.current_mode == "live":
+            self._show_rl_training_view()
+            self._update_rl_training_dashboard()
+        elif (not self.rl_training_enabled) and self.current_mode == "live":
+            self._show_live_view()
+
+    def _on_train_rl_toggled(self, checked: bool):
+        if not checked:
+            self._set_rl_training(False)
+            return
+
+        policy = self._get_rl_policy()
+        if policy is None:
+            self._set_rl_training(False)
+            return
+
+        if self.current_mode != "live":
+            self._switch_mode("live")
+
+        if self.agent_controller.active_policy_name != "RL agent":
+            ok = self.agent_controller.set_active_policy("RL agent")
+            if not ok:
+                self._notify_user("Could not activate RL agent policy.")
+                self._set_rl_training(False)
+                return
+            self._set_agent_selector_text("RL agent")
+
+        # Training should run with agent control, not human control.
+        self.bus.publish("HumanModeRequested", {"enabled": False})
+        self.bus.publish("PlayRequested", {})
+
+        try:
+            policy.reset_episode()
+        except Exception:
+            pass
+
+        self.rl_episode_count = 0
+        self.rl_steps_in_episode = 0
+        self.rl_total_steps = 0
+        self._rl_last_step_seen = int(getattr(self.env, "global_step", 0))
+        self.rl_last_autosave_episode = 0
+        self.rl_training_start_time = time.time()
+        self.rl_episode_rewards = []
+        self.rl_episode_steps_history = []
+        self.rl_stop_reasons = {"phase_transition": 0, "death": 0, "max_steps": 0}
+        self._set_rl_training(True)
+
+    def _on_rl_max_steps_changed(self, value: int):
+        self.rl_max_episode_steps = int(value)
+        self._update_rl_training_dashboard()
+
+    def _save_rl_checkpoint(self, *, auto: bool):
+        policy = self._get_rl_policy()
+        if policy is None:
+            return
+        try:
+            policy.save(self.rl_checkpoint_path)
+            if not auto:
+                self._notify_user(f"Saved RL checkpoint:\n{self.rl_checkpoint_path}")
+            else:
+                self.rl_last_autosave_episode = int(self.rl_episode_count)
+        except Exception as e:
+            self._notify_user(f"Failed to save RL checkpoint:\n{e}")
+
+    def _load_rl_checkpoint(self):
+        policy = self._get_rl_policy()
+        if policy is None:
+            return
+        if not os.path.exists(self.rl_checkpoint_path):
+            self._notify_user(f"No checkpoint found:\n{self.rl_checkpoint_path}")
+            return
+        try:
+            policy.load(self.rl_checkpoint_path)
+            if self.agent_controller.active_policy_name != "RL agent":
+                self.agent_controller.set_active_policy("RL agent")
+                self._set_agent_selector_text("RL agent")
+            self._notify_user(f"Loaded RL checkpoint:\n{self.rl_checkpoint_path}")
+            self._update_rl_training_dashboard()
+        except Exception as e:
+            self._notify_user(f"Failed to load RL checkpoint:\n{e}")
+
+    def _update_rl_training_dashboard(self):
+        policy = self._get_rl_policy()
+        snap = self.env.snapshot_state()
+        phase = int(getattr(snap, "phase", 1))
+        stomach = float(getattr(snap, "stomach", 0.0))
+
+        learning_enabled = "-"
+        total_updates = 0
+        last_reward = 0.0
+        episode_reward = 0.0
+        best_episode_reward = 0.0
+
+        if policy is not None:
+            learning_enabled = bool(getattr(policy, "learning_enabled", False))
+            total_updates = int(getattr(policy, "total_updates", 0))
+            last_reward = float(getattr(policy, "last_reward", 0.0))
+            episode_reward = float(getattr(policy, "episode_reward", 0.0))
+            best_episode_reward = float(getattr(policy, "best_episode_reward", 0.0))
+
+        if best_episode_reward == float("-inf"):
+            best_episode_reward = 0.0
+
+        elapsed = 0.0
+        if self.rl_training_start_time is not None:
+            elapsed = max(1e-6, time.time() - float(self.rl_training_start_time))
+        steps_per_sec = (float(self.rl_total_steps) / elapsed) if elapsed > 0.0 else 0.0
+        episodes_per_min = (float(self.rl_episode_count) / elapsed * 60.0) if elapsed > 0.0 else 0.0
+
+        recent_rewards = self.rl_episode_rewards[-20:]
+        recent_steps = self.rl_episode_steps_history[-20:]
+        reward_avg_20 = (sum(recent_rewards) / len(recent_rewards)) if recent_rewards else 0.0
+        steps_avg_20 = (sum(recent_steps) / len(recent_steps)) if recent_steps else 0.0
+
+        metrics = {
+            "training_status": "ON" if self.rl_training_enabled else "OFF",
+            "policy_name": str(self.agent_controller.active_policy_name or "-"),
+            "episode_count": int(self.rl_episode_count),
+            "steps_episode": int(self.rl_steps_in_episode),
+            "steps_total": int(self.rl_total_steps),
+            "updates_total": int(total_updates),
+            "steps_per_sec": f"{steps_per_sec:.2f}",
+            "episodes_per_min": f"{episodes_per_min:.2f}",
+            "phase": int(phase),
+            "learning_enabled": learning_enabled,
+            "stomach": f"{stomach:.4f}",
+            "last_reward": f"{last_reward:.6f}",
+            "episode_reward": f"{episode_reward:.6f}",
+            "best_episode_reward": f"{best_episode_reward:.6f}",
+            "reward_avg_20": f"{reward_avg_20:.6f}",
+            "steps_avg_20": f"{steps_avg_20:.2f}",
+            "phase1_stop_phase2": int(self.rl_stop_reasons.get("phase_transition", 0)),
+            "phase1_stop_death": int(self.rl_stop_reasons.get("death", 0)),
+            "phase1_stop_max_steps": int(self.rl_stop_reasons.get("max_steps", 0)),
+            "autosave_every": f"{int(self.rl_autosave_every)} episodes",
+            "last_autosave_episode": int(self.rl_last_autosave_episode),
+            "checkpoint_path": self.rl_checkpoint_path,
+            "reward_history": self.rl_episode_rewards[-120:],
+            "steps_history": self.rl_episode_steps_history[-120:],
+        }
+        self.rl_training_panel.update_metrics(metrics)
+
+    def _maybe_handle_rl_training_step(self):
+        if not self.rl_training_enabled:
+            return
+        if self.current_mode != "live":
+            return
+
+        step_now = int(getattr(self.env, "global_step", 0))
+        if step_now <= self._rl_last_step_seen:
+            return
+
+        step_delta = step_now - self._rl_last_step_seen
+        self._rl_last_step_seen = step_now
+        self.rl_steps_in_episode += step_delta
+        self.rl_total_steps += step_delta
+
+        snap = self.env.snapshot_state()
+        phase = int(getattr(snap, "phase", 1))
+        death = bool(self.env.check_death()) if hasattr(self.env, "check_death") else False
+        max_steps_hit = self.rl_steps_in_episode >= int(self.rl_max_episode_steps)
+
+        # Hard cap training episodes at phase 1.
+        if phase >= 2 or death or max_steps_hit:
+            self.rl_episode_count += 1
+            if max_steps_hit:
+                reason = "max_steps"
+            elif phase >= 2:
+                reason = "phase_transition"
+            else:
+                reason = "death"
+            self.rl_stop_reasons[reason] = int(self.rl_stop_reasons.get(reason, 0)) + 1
+
+            policy = self._get_rl_policy()
+            if reason == "death" and policy is not None:
+                try:
+                    policy.apply_terminal_reward(-100.0)
+                except Exception:
+                    pass
+            episode_reward = 0.0
+            if policy is not None:
+                episode_reward = float(getattr(policy, "episode_reward", 0.0))
+            self.rl_episode_rewards.append(episode_reward)
+            self.rl_episode_steps_history.append(int(self.rl_steps_in_episode))
+            self.bus.publish(
+                "RLTrainingEpisodeFinished",
+                {
+                    "episode": self.rl_episode_count,
+                    "steps": self.rl_steps_in_episode,
+                    "reason": reason,
+                },
+            )
+
+            if self.rl_episode_count % self.rl_autosave_every == 0:
+                self._save_rl_checkpoint(auto=True)
+
+            self.rl_steps_in_episode = 0
+
+            # Reset to a fresh phase-1 episode and continue training forever
+            self.env.reset()
+            if policy is not None:
+                try:
+                    policy.reset_episode()
+                except Exception:
+                    pass
+
+            self._rl_last_step_seen = int(getattr(self.env, "global_step", 0))
+            try:
+                self._emit_render_packet()
+            except Exception:
+                pass
+            try:
+                self.bus.publish("EnvStateUpdated", self.env.snapshot_state())
+            except Exception:
+                pass
+
+        self._update_rl_training_dashboard()
 
                                                            
     def _on_toggle_record(self, checked: bool):
@@ -731,6 +1071,12 @@ class AppController(QMainWindow):
         except Exception:
             pass
 
+    def _show_rl_training_view(self):
+        try:
+            self.viewport.setCurrentWidget(self.rl_training_panel)
+        except Exception:
+            pass
+
     def _on_session_preview_activated(self, payload: Dict[str, Any]):
         try:
             sid = payload.get("session_id")
@@ -816,7 +1162,11 @@ class AppController(QMainWindow):
         self.last_tick_time = now
 
         if self.current_mode == "live":
-            self.live_runner.tick(dt=dt)
+            if self.rl_training_enabled:
+                self.live_runner._on_step_request({"mode": "live", "training_mode": True})
+            else:
+                self.live_runner.tick(dt=dt)
+            self._maybe_handle_rl_training_step()
 
         elif self.current_mode == "playback":
                         

@@ -378,13 +378,17 @@ class LiveRunner:
         )
 
     def _on_step_request(self, payload: Dict[str, Any]):
+        training_mode = bool((payload or {}).get("training_mode", False))
 
         # Build low-resolution agent observation from snapshot
         env_state: EnvStateSnapshot = self.env.snapshot_state()
-        try:
-            agent_frame = self.agent_renderer.render(env_state)
-        except Exception:
+        if training_mode:
             agent_frame = None
+        else:
+            try:
+                agent_frame = self.agent_renderer.render(env_state)
+            except Exception:
+                agent_frame = None
 
         obs = build_observation(env_state, agent_frame)
 
@@ -401,6 +405,9 @@ class LiveRunner:
         self.env.step(action)
 
         new_state: EnvStateSnapshot = self.env.snapshot_state()
+
+        if training_mode:
+            return
 
         # publish both legacy state for loggers and a render packet for UI
         self.bus.publish("EnvStateUpdated", new_state)

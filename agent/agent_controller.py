@@ -13,10 +13,14 @@ class AgentController:
     def __init__(
         self,
         policy: Optional[Any] = None,
+        policies: Optional[Dict[str, Any]] = None,
+        active_policy_name: Optional[str] = None,
         logging_agent: Optional[LoggingAgent] = None,
         tools: Optional[Dict[str, Any]] = None,
     ):
         self.policy = policy
+        self.policies: Dict[str, Any] = {}
+        self.active_policy_name: Optional[str] = None
         self.logging_agent = logging_agent
         self.tools = tools or {}
 
@@ -29,18 +33,49 @@ class AgentController:
                                       
         self.context: AgentExecutionContext = AgentExecutionContext.LIVE
 
+        if policy is not None:
+            self.register_policy("default", policy, set_active=True)
+
+        if policies:
+            for name, policy_obj in policies.items():
+                self.register_policy(name, policy_obj, set_active=False)
+
+        if active_policy_name is not None:
+            self.set_active_policy(active_policy_name)
+
+    def register_policy(self, name: str, policy: Any, *, set_active: bool = False):
+        if not name:
+            raise ValueError("Policy name must be a non-empty string.")
+        self.policies[name] = policy
+        if set_active or self.active_policy_name is None:
+            self.active_policy_name = name
+            self.policy = policy
+
+    def list_policies(self):
+        return list(self.policies.keys())
+
+    def set_active_policy(self, name: str) -> bool:
+        policy = self.policies.get(name)
+        if policy is None:
+            return False
+        self.active_policy_name = name
+        self.policy = policy
+        return True
+
                                                               
     def set_execution_enabled(self, flag: bool):
 
 
         self.execution_enabled = flag
-        self.logging_agent.set_context(self.context)
+        if self.logging_agent is not None:
+            self.logging_agent.set_context(self.context)
 
     def set_context(self, context: AgentExecutionContext):
 
 
         self.context = context
-        self.logging_agent.set_context(context)
+        if self.logging_agent is not None:
+            self.logging_agent.set_context(context)
 
     def set_policy_frozen(self, frozen: bool):
 

@@ -59,3 +59,41 @@ class StarterWanderPolicy(AgentPolicy):
 
         action = (self.direction * self.speed).astype(np.float32)
         return action, None
+
+
+class NoOpPolicy(AgentPolicy):
+    """Always emits zero action. Useful as a baseline."""
+
+    def act(
+        self,
+        observation: Any,
+        tools: Dict[str, Any],
+        *,
+        context: AgentExecutionContext = AgentExecutionContext.LIVE,
+    ) -> Tuple[list, Optional[Tuple[list, list]]]:
+        return np.array([0.0, 0.0], dtype=np.float32), None
+
+
+class OscillatingPolicy(AgentPolicy):
+    """
+    Deterministic cyclical movement for repeatable behavior checks.
+    """
+
+    def __init__(self, *, speed: float = 0.8, angular_step: float = 0.2):
+        self.speed = float(np.clip(speed, 0.0, 1.0))
+        self.angular_step = float(max(0.001, angular_step))
+        self.t = 0.0
+
+    def act(
+        self,
+        observation: Any,
+        tools: Dict[str, Any],
+        *,
+        context: AgentExecutionContext = AgentExecutionContext.LIVE,
+    ) -> Tuple[list, Optional[Tuple[list, list]]]:
+        self.t += self.angular_step
+        action = np.array(
+            [np.cos(self.t), np.sin(self.t)],
+            dtype=np.float32,
+        ) * self.speed
+        return action, None
