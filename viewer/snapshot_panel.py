@@ -48,8 +48,20 @@ class SnapshotPanel(QWidget):
         bus.subscribe("TraceCursorMoved", self._on_cursor_state)
         bus.subscribe("EnvStateUpdated", self._on_live_env_state)
         bus.subscribe("EditModeToggled", self._on_edit_mode_toggled)
+        bus.subscribe("LivePausedStateChanged", self._on_live_paused_state_changed)
 
         self.edit_mode_enabled: bool = False
+        self.live_paused: bool = False
+
+        self._tool_buttons = [
+            self.toggle_wall_btn,
+            self.set_stomach_btn,
+            self.advance_seq_btn,
+            self.phase_down_btn,
+            self.phase_up_btn,
+            self.reset_env_btn,
+        ]
+        self._refresh_tool_enabled_state()
 
                                                           
     def _on_cursor_state(self, payload: Dict[str, Any]):
@@ -111,11 +123,27 @@ class SnapshotPanel(QWidget):
         # Only emit edits when edit mode is enabled
         if not getattr(self, "edit_mode_enabled", False):
             return
+        # Force pause before edit to satisfy AppController edit gate.
+        if not getattr(self, "live_paused", False):
+            self.bus.publish("PauseRequested", {})
 
         self.bus.publish("EnvEditRequested", {"mutation": mutation})
 
     def _on_edit_mode_toggled(self, payload: Dict[str, Any]):
         self.edit_mode_enabled = bool(payload.get("enabled", False))
+        self._refresh_tool_enabled_state()
+
+    def _on_live_paused_state_changed(self, payload: Dict[str, Any]):
+        self.live_paused = bool((payload or {}).get("paused", False))
+        self._refresh_tool_enabled_state()
+
+    def _refresh_tool_enabled_state(self):
+        enabled = bool(self.edit_mode_enabled and self.live_paused)
+        for btn in self._tool_buttons:
+            try:
+                btn.setEnabled(enabled)
+            except Exception:
+                pass
 
     def _on_toggle_wall(self):
         snap = self.build_snapshot()
@@ -234,5 +262,9 @@ class SnapshotPanel(QWidget):
         self.bus.publish("EvalRunRequested", payload)
 
     def _on_reset_env(self):
+        if not getattr(self, "edit_mode_enabled", False):
+            return
+        if not getattr(self, "live_paused", False):
+            self.bus.publish("PauseRequested", {})
         # Publish a reset request; controller will handle authoritative reset
         self.bus.publish("EnvResetRequested", {})

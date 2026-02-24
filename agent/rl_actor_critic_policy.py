@@ -113,6 +113,11 @@ class RLActorCriticFoodPolicy(AgentPolicy):
         self.best_episode_reward = float("-inf")
         self.episodes_seen = 0
 
+        # Reward-shaping knobs for satiety-aware behavior.
+        self.safe_stomach_high = 1.05
+        self.full_penalty_start = 1.20
+        self.near_death_start = 1.45
+
     def _nearest_active_pod_delta(self, obs: Dict[str, Any]) -> Tuple[np.ndarray, float]:
         agent_pos = np.array(obs.get("agent_pos", [0.0, 0.0]), dtype=np.float32)
         pods = obs.get("pods", []) or []
@@ -174,8 +179,36 @@ class RLActorCriticFoodPolicy(AgentPolicy):
         stomach_delta = stomach - float(self.prev_stomach)
         dist_progress = float(self.prev_nearest_dist) - nearest_dist
 
-        # Dense shaping for faster learning in this environment.
-        reward = (10.0 * stomach_delta) + (0.4 * dist_progress) - 0.001
+        # Hunger gate: as stomach rises, extra food should become less desirable.
+        sat = 1.0 / (1.0 + np.exp(-(stomach - self.safe_stomach_high) / 0.08))
+        appetite = 1.0 - sat
+
+        # Food gain reward is strong while hungry, weak/negative when too full.
+        food_reward = 7.5 * stomach_delta * appetite
+
+        # Motion shaping remains, but also attenuates when satiated.
+        dist_reward = 0.45 * dist_progress * (0.4 + appetite)
+
+        # Explicit dense penalties for fullness risk (before terminal death).
+        fullness_penalty = 6.0 * max(0.0, stomach - self.full_penalty_start) ** 2
+        near_death_penalty = 28.0 * max(0.0, stomach - self.near_death_start) ** 2
+
+        # Additional penalty for increasing stomach while already over-full.
+        overfill_gain_penalty = (
+            22.0 * max(0.0, stomach_delta) * max(0.0, stomach - self.full_penalty_start)
+        )
+
+        # Small survival bonus so safe wandering/waiting can beat greedy overfilling.
+        alive_bonus = 0.008
+
+        reward = (
+            food_reward
+            + dist_reward
+            + alive_bonus
+            - fullness_penalty
+            - near_death_penalty
+            - overfill_gain_penalty
+        )
         return float(reward)
 
     def _current_std(self) -> torch.Tensor:

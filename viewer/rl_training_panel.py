@@ -77,6 +77,7 @@ class RLTrainingPanel(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.graphs_paused = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -190,8 +191,12 @@ class RLTrainingPanel(QWidget):
         for key, label in self.value_labels.items():
             val = metrics.get(key, "-")
             label.setText(str(val))
-        self.reward_chart.set_values(metrics.get("reward_history", []))
-        self.steps_chart.set_values(metrics.get("steps_history", []))
+        if not self.graphs_paused:
+            self.reward_chart.set_values(metrics.get("reward_history", []))
+            self.steps_chart.set_values(metrics.get("steps_history", []))
 
     def set_max_episode_steps(self, value: int):
         self.max_steps_spin.setValue(int(value))
+
+    def set_graphs_paused(self, paused: bool):
+        self.graphs_paused = bool(paused)

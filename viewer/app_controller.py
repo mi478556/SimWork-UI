@@ -110,6 +110,8 @@ class AppController(QMainWindow):
         self._rl_last_step_seen = 0
         self.rl_last_autosave_episode = 0
         self.rl_training_start_time = None
+        self.rl_training_active_elapsed = 0.0
+        self.rl_training_active_started_at = None
         self.rl_episode_rewards = []
         self.rl_episode_steps_history = []
         self.rl_stop_reasons = {"phase_transition": 0, "death": 0, "max_steps": 0}
@@ -270,17 +272,8 @@ class AppController(QMainWindow):
         self.trace_player_panel = TracePlayerPanel(self.store, self.bus)
         self.snapshot_panel = SnapshotPanel(self.bus)
 
-        # SnapshotPanel is only visible in edit (god) mode; keep it hidden by default
+        # SnapshotPanel is only visible in edit mode when allowed.
         self.snapshot_panel.setVisible(False)
-        # Show/hide when edit mode toggles
-        self.bus.subscribe("EditModeToggled", lambda p: self.snapshot_panel.setVisible(bool(p.get("enabled", False))))
-        # Also hide while human-as-agent control is active; restore visibility based on edit_mode_btn
-        self.bus.subscribe(
-            "HumanAsAgentToggled",
-            lambda p: self.snapshot_panel.setVisible(False)
-            if p.get("enabled", False)
-            else self.snapshot_panel.setVisible(bool(self.edit_mode_btn.isChecked())),
-        )
 
         top_row.addWidget(self.trace_browser_panel, stretch=1)
         top_row.addWidget(self.trace_player_panel, stretch=2)
@@ -316,6 +309,7 @@ class AppController(QMainWindow):
         # edit mode state (god-mode)
         self.edit_mode = False
         self.bus.subscribe("EditModeToggled", lambda p: setattr(self, "edit_mode", bool(p.get("enabled", False))))
+        self.bus.subscribe("EditModeToggled", lambda p: self._refresh_edit_tools_ui())
 
         self.bus.subscribe("InjectRequested", self._on_inject_request)
         self.bus.subscribe("AgentStepRequested", self._on_agent_step)
@@ -389,6 +383,7 @@ class AppController(QMainWindow):
         # Canonical controller state
         self.sim_state = "RUNNING"
         self.control_mode = "AGENT"
+        self._refresh_edit_tools_ui()
 
         # Preview hooks
 
@@ -487,6 +482,8 @@ class AppController(QMainWindow):
             except Exception:
                 pass
 
+        self._refresh_edit_tools_ui()
+
     # ------------------------------------------------------------
     # Centralized control intent handlers
     # ------------------------------------------------------------
@@ -505,8 +502,14 @@ class AppController(QMainWindow):
             pass
         # publish legacy event consumed by runners
         self.bus.publish("LivePlay", {})
+        if self.rl_training_enabled and self.rl_training_active_started_at is None:
+            self.rl_training_active_started_at = time.time()
+        try:
+            self.rl_training_panel.set_graphs_paused(False)
+        except Exception:
+            pass
         # If user armed recording while paused, start capture on play — check pipeline
-        if self.record_intent == self.REC_ARMED:
+        if self.record_intent == self.REC_ARMED and (not self.rl_training_enabled):
             try:
                 # Use pipeline depth policy rather than is_busy() to decide
                 if self.finalize_mgr.pipeline_depth() < 2:
@@ -539,15 +542,35 @@ class AppController(QMainWindow):
         except Exception:
             pass
         self.bus.publish("LivePause", {})
+        if self.rl_training_enabled and self.rl_training_active_started_at is not None:
+            self.rl_training_active_elapsed += max(0.0, time.time() - float(self.rl_training_active_started_at))
+            self.rl_training_active_started_at = None
+        try:
+            self.rl_training_panel.set_graphs_paused(True)
+        except Exception:
+            pass
 
     def _on_edit_mode_requested(self, payload):
         enabled = bool(payload.get("enabled", False))
+        if enabled and self.rl_training_enabled:
+            self.edit_mode = False
+            try:
+                self.edit_mode_btn.setChecked(False)
+            except Exception:
+                pass
+            self.bus.publish("EditModeToggled", {"enabled": False})
+            return
         if enabled:
             # Editing forces pause
             self.sim_state = "PAUSED"
             try:
                 self.play_control_btn.setChecked(False)
                 self.pause_control_btn.setChecked(True)
+            except Exception:
+                pass
+            try:
+                # Make pause immediate so edit tools work right away.
+                self.live_runner.pause()
             except Exception:
                 pass
             self.edit_mode = True
@@ -565,9 +588,12 @@ class AppController(QMainWindow):
             except Exception:
                 pass
             self.bus.publish("EditModeToggled", {"enabled": False})
+        self._refresh_edit_tools_ui()
 
     def _on_human_mode_requested(self, payload):
         enabled = bool(payload.get("enabled", False))
+        if self.rl_training_enabled and enabled:
+            enabled = False
         self.control_mode = "HUMAN" if enabled else "AGENT"
         try:
             self.human_btn.setChecked(enabled)
@@ -575,6 +601,7 @@ class AppController(QMainWindow):
             pass
         # publish the legacy toggle for downstream consumers
         self.bus.publish("HumanAsAgentToggled", {"enabled": enabled})
+        self._refresh_edit_tools_ui()
 
     def _on_agent_policy_requested(self, payload):
         name = str(payload.get("name", "")).strip()
@@ -625,6 +652,9 @@ class AppController(QMainWindow):
                 pass
 
     def _set_rl_training(self, enabled: bool):
+        if (not enabled) and self.rl_training_active_started_at is not None:
+            self.rl_training_active_elapsed += max(0.0, time.time() - float(self.rl_training_active_started_at))
+            self.rl_training_active_started_at = None
         self.rl_training_enabled = bool(enabled)
         try:
             self.train_rl_btn.blockSignals(True)
@@ -641,10 +671,56 @@ class AppController(QMainWindow):
             self.timer.start(0 if self.rl_training_enabled else 16)
         except Exception:
             pass
+        if self.rl_training_enabled and self.edit_mode:
+            self.edit_mode = False
+            try:
+                self.edit_mode_btn.setChecked(False)
+            except Exception:
+                pass
+            try:
+                self.bus.publish("EditModeToggled", {"enabled": False})
+            except Exception:
+                pass
+
+        if self.rl_training_enabled:
+            # RL training mode forbids human control, freeze, and recording.
+            try:
+                if self.control_mode == "HUMAN":
+                    self.bus.publish("HumanAsAgentToggled", {"enabled": False})
+                self.control_mode = "AGENT"
+                self.human_btn.setChecked(False)
+            except Exception:
+                pass
+
+            try:
+                self.freeze_btn.setChecked(False)
+                self.bus.publish("AgentFreezeToggled", {"enabled": False})
+            except Exception:
+                pass
+
+            try:
+                if self.record_intent in (self.REC_CAPTURING, self.REC_REQUESTED):
+                    self.bus.publish("CaptureStopRequested", {})
+                self.record_intent = self.REC_OFF
+                self.record_btn.setChecked(False)
+            except Exception:
+                pass
+
+        self._refresh_edit_tools_ui()
         if self.rl_training_enabled and self.current_mode == "live":
+            try:
+                self.rl_training_panel.set_graphs_paused(getattr(self.live_runner, "is_paused", False))
+            except Exception:
+                pass
+            if not getattr(self.live_runner, "is_paused", False) and self.rl_training_active_started_at is None:
+                self.rl_training_active_started_at = time.time()
             self._show_rl_training_view()
             self._update_rl_training_dashboard()
         elif (not self.rl_training_enabled) and self.current_mode == "live":
+            try:
+                self.rl_training_panel.set_graphs_paused(False)
+            except Exception:
+                pass
             self._show_live_view()
 
     def _on_train_rl_toggled(self, checked: bool):
@@ -670,7 +746,8 @@ class AppController(QMainWindow):
 
         # Training should run with agent control, not human control.
         self.bus.publish("HumanModeRequested", {"enabled": False})
-        self.bus.publish("PlayRequested", {})
+        # Enter RL training mode paused; explicit Play starts stepping.
+        self.bus.publish("PauseRequested", {})
 
         try:
             policy.reset_episode()
@@ -683,6 +760,8 @@ class AppController(QMainWindow):
         self._rl_last_step_seen = int(getattr(self.env, "global_step", 0))
         self.rl_last_autosave_episode = 0
         self.rl_training_start_time = time.time()
+        self.rl_training_active_elapsed = 0.0
+        self.rl_training_active_started_at = None
         self.rl_episode_rewards = []
         self.rl_episode_steps_history = []
         self.rl_stop_reasons = {"phase_transition": 0, "death": 0, "max_steps": 0}
@@ -744,9 +823,10 @@ class AppController(QMainWindow):
         if best_episode_reward == float("-inf"):
             best_episode_reward = 0.0
 
-        elapsed = 0.0
-        if self.rl_training_start_time is not None:
-            elapsed = max(1e-6, time.time() - float(self.rl_training_start_time))
+        elapsed = float(self.rl_training_active_elapsed)
+        if self.rl_training_enabled and self.rl_training_active_started_at is not None:
+            elapsed += max(0.0, time.time() - float(self.rl_training_active_started_at))
+        elapsed = max(1e-6, elapsed)
         steps_per_sec = (float(self.rl_total_steps) / elapsed) if elapsed > 0.0 else 0.0
         episodes_per_min = (float(self.rl_episode_count) / elapsed * 60.0) if elapsed > 0.0 else 0.0
 
@@ -861,6 +941,13 @@ class AppController(QMainWindow):
 
                                                            
     def _on_toggle_record(self, checked: bool):
+        if self.rl_training_enabled:
+            try:
+                self.record_btn.setChecked(False)
+            except Exception:
+                pass
+            self.record_intent = self.REC_OFF
+            return
         # Focus live env for recording
         try:
             self.bus.publish("RequestFocusLiveEnv", {})
@@ -926,6 +1013,12 @@ class AppController(QMainWindow):
         - depth < 2 -> recording allowed
         - depth >= 2 -> recording disabled + pause
         """
+        if self.rl_training_enabled:
+            try:
+                self.record_btn.setEnabled(False)
+            except Exception:
+                pass
+            return
         try:
             if depth >= 2:
                 self.record_btn.setEnabled(False)
@@ -943,6 +1036,7 @@ class AppController(QMainWindow):
                 self.record_btn.setEnabled(True)
         except Exception:
             pass
+        self._refresh_edit_tools_ui()
 
     def _on_finalize_busy(self, busy: bool):
         """
@@ -1022,6 +1116,7 @@ class AppController(QMainWindow):
             self.record_btn.setEnabled(True)
         except Exception:
             pass
+        self._refresh_edit_tools_ui()
 
     def _submit_finalize_job(self, job):
         """
@@ -1163,7 +1258,8 @@ class AppController(QMainWindow):
 
         if self.current_mode == "live":
             if self.rl_training_enabled:
-                self.live_runner._on_step_request({"mode": "live", "training_mode": True})
+                if not getattr(self.live_runner, "is_paused", False):
+                    self.live_runner._on_step_request({"mode": "live", "training_mode": True})
             else:
                 self.live_runner.tick(dt=dt)
             self._maybe_handle_rl_training_step()
@@ -1408,6 +1504,13 @@ class AppController(QMainWindow):
 
                                                            
     def _on_agent_freeze(self, payload):
+        if self.rl_training_enabled:
+            self.agent_controller.unfreeze_policy()
+            try:
+                self.freeze_btn.setChecked(False)
+            except Exception:
+                pass
+            return
         if payload["enabled"]:
             self.agent_controller.freeze_policy()
         else:
@@ -1437,7 +1540,7 @@ class AppController(QMainWindow):
         enabled = bool(payload.get("enabled", False))
         try:
             # disable edit mode while human-as-agent is active
-            self.edit_mode_btn.setEnabled(not enabled)
+            self.edit_mode_btn.setEnabled((not enabled) and (not self.rl_training_enabled))
             if enabled and self.edit_mode_btn.isChecked():
                 # turn off edit mode if human control is enabled
                 self.edit_mode_btn.setChecked(False)
@@ -1450,76 +1553,127 @@ class AppController(QMainWindow):
                     pass
         except Exception:
             pass
+        self._refresh_edit_tools_ui()
 
     def _can_edit_live_env(self) -> bool:
         # Only allow edits when in live mode and live runner is paused
         if self.current_mode != "live":
             return False
+        if self.rl_training_enabled:
+            return False
         return getattr(self.live_runner, "is_paused", False) and getattr(self, "edit_mode", False)
+
+    def _refresh_edit_tools_ui(self):
+        human_enabled = (self.control_mode == "HUMAN")
+        allow_edit = (not self.rl_training_enabled) and (not human_enabled)
+        allow_training_extras = not self.rl_training_enabled
+
+        try:
+            self.edit_mode_btn.setEnabled(allow_edit)
+        except Exception:
+            pass
+
+        try:
+            self.human_btn.setEnabled(allow_training_extras)
+        except Exception:
+            pass
+
+        try:
+            self.freeze_btn.setEnabled(allow_training_extras)
+        except Exception:
+            pass
+
+        try:
+            if self.rl_training_enabled:
+                self.record_btn.setEnabled(False)
+            else:
+                can_record = (self.current_mode == "live")
+                try:
+                    can_record = can_record and (self.finalize_mgr.pipeline_depth() < 2)
+                except Exception:
+                    pass
+                self.record_btn.setEnabled(bool(can_record))
+        except Exception:
+            pass
+
+        show_snapshot = allow_edit and bool(getattr(self, "edit_mode", False))
+        try:
+            self.snapshot_panel.setVisible(show_snapshot)
+        except Exception:
+            pass
 
     def _on_env_edit_requested(self, payload):
         # Payload expected to contain a 'mutation' dict or full snapshot
         if not self._can_edit_live_env():
             return
 
-        mutation = payload.get("mutation", {}) or {}
-        phase_was_edited = "phase" in mutation
-
-        # Get current canonical snapshot
-        current = self.env.snapshot_state()
-
-        # Convert current snapshot to a plain runtime dict, merge mutation
         try:
-            candidate = snapshot_to_runtime_dict(current)
-        except Exception:
-            # fallback: try dict-like conversion
+            mutation = payload.get("mutation", {}) or {}
+            phase_was_edited = "phase" in mutation
+
+            # Get current canonical snapshot
+            current = self.env.snapshot_state()
+
+            # Convert current snapshot to a plain runtime dict, merge mutation
             try:
-                candidate = dict(current)
+                candidate = snapshot_to_runtime_dict(current)
             except Exception:
-                candidate = {}
+                # fallback: try dict-like conversion
+                try:
+                    candidate = dict(current)
+                except Exception:
+                    candidate = {}
 
-        # deep merge for nested fields so patches like {"wall": {"enabled": False}} work
-        def _deep_update(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
-            out = dict(base)
-            for k, v in (patch or {}).items():
-                if isinstance(v, dict) and isinstance(out.get(k), dict):
-                    out[k] = _deep_update(out.get(k, {}), v)
-                else:
-                    out[k] = v
-            return out
+            # deep merge for nested fields so patches like {"wall": {"enabled": False}} work
+            def _deep_update(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+                out = dict(base)
+                for k, v in (patch or {}).items():
+                    if isinstance(v, dict) and isinstance(out.get(k), dict):
+                        out[k] = _deep_update(out.get(k, {}), v)
+                    else:
+                        out[k] = v
+                return out
 
-        candidate = _deep_update(candidate, mutation)
+            candidate = _deep_update(candidate, mutation)
 
-        # normalize into EnvStateSnapshot and validate preview
-        normalized_snap = self.bridge.normalize_snapshot(candidate)
-        normalized, advisories = self.bridge.validate_snapshot_preview(normalized_snap)
+            # normalize into EnvStateSnapshot and validate preview
+            normalized_snap = self.bridge.normalize_snapshot(candidate)
+            normalized, advisories = self.bridge.validate_snapshot_preview(normalized_snap)
 
-        # Publish validation results to UI
-        try:
-            self.bus.publish("SnapshotValidationResult", {
-                "normalized": normalized,
-                "advisories": advisories,
-            })
-        except Exception:
-            pass
-
-        # Apply the normalized snapshot to the environment (edit-origin)
-        self.bridge.apply_snapshot(normalized, from_edit=True)
-
-        if phase_was_edited:
+            # Publish validation results to UI
             try:
-                self.env._configure_phase_state()
+                self.bus.publish("SnapshotValidationResult", {
+                    "normalized": normalized,
+                    "advisories": advisories,
+                })
             except Exception:
                 pass
 
-        # After applying an edit to the runtime, emit render packet
-        try:
-            self._emit_render_packet()
-        except Exception:
-            pass
+            # Apply the normalized snapshot to the environment (edit-origin)
+            self.bridge.apply_snapshot(normalized, from_edit=True)
 
-        # Notify other systems of the new state
-        self.bus.publish("EnvStateUpdated", normalized)
+            if phase_was_edited:
+                try:
+                    self.env._configure_phase_state()
+                except Exception:
+                    pass
+
+            # After applying an edit to the runtime, emit render packet
+            try:
+                self._emit_render_packet()
+            except Exception:
+                pass
+
+            # Notify other systems of the new state
+            self.bus.publish("EnvStateUpdated", normalized)
+        except Exception:
+            try:
+                self.bus.publish("SnapshotValidationResult", {
+                    "normalized": None,
+                    "advisories": [{"level": "error", "message": "Edit mutation failed to apply."}],
+                })
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         try:
