@@ -49,6 +49,8 @@ class LiveRunner:
         # Human control wiring
         self.human_enabled: bool = False
         self.frozen: bool = False
+        self.pause_frozen: bool = False
+        self.explicit_frozen: bool = False
         self.human_controller = HumanController(bus)
 
         # offscreen renderers: low-res for agent obs, high-res for UI
@@ -241,7 +243,13 @@ class LiveRunner:
             pass
 
     def _on_freeze_toggle(self, payload: Dict[str, Any]):
-        self.frozen = bool(payload.get("enabled", False))
+        enabled = bool(payload.get("enabled", False))
+        reason = str(payload.get("reason", "explicit")).strip().lower()
+        if reason == "pause":
+            self.pause_frozen = enabled
+        else:
+            self.explicit_frozen = enabled
+        self.frozen = bool(self.pause_frozen or self.explicit_frozen)
 
     def _on_speed_changed(self, payload: Dict[str, Any]):
         # placeholder: speed handling could scale dt or pacing
@@ -379,6 +387,7 @@ class LiveRunner:
 
     def _on_step_request(self, payload: Dict[str, Any]):
         training_mode = bool((payload or {}).get("training_mode", False))
+        force_agent_action = bool((payload or {}).get("force_agent_action", False))
 
         # Build low-resolution agent observation from snapshot
         env_state: EnvStateSnapshot = self.env.snapshot_state()
@@ -392,7 +401,7 @@ class LiveRunner:
 
         obs = build_observation(env_state, agent_frame)
 
-        action, oracle_distance = self._choose_action(obs)
+        action, oracle_distance = self._choose_action(obs, force_agent_action=force_agent_action)
 
         if self.logging_agent is not None:
             self.logging_agent.act(
@@ -467,9 +476,15 @@ class LiveRunner:
     # Action selection / human arbitration
     # ------------------------------------------------------------
 
-    def _choose_action(self, obs):
-        # frozen -> no action
-        if self.frozen:
+    def _choose_action(self, obs, *, force_agent_action: bool = False):
+        # Explicit user freeze always wins.
+        if self.explicit_frozen:
+            import numpy as _np
+
+            return _np.array([0.0, 0.0], dtype=_np.float32), 0.0
+
+        # Pause-induced freeze can be bypassed for single-step.
+        if self.pause_frozen and (not force_agent_action):
             import numpy as _np
 
             return _np.array([0.0, 0.0], dtype=_np.float32), 0.0
@@ -487,10 +502,11 @@ class LiveRunner:
         # start/resume play
         self.playing = True
         self.is_paused = False
-        # IMPORTANT: unfreeze agent on resume
-        self.frozen = False
+        # IMPORTANT: clear pause-induced freeze on resume.
+        self.pause_frozen = False
+        self.frozen = bool(self.pause_frozen or self.explicit_frozen)
         try:
-            self.bus.publish("AgentFreezeToggled", {"enabled": False})
+            self.bus.publish("AgentFreezeToggled", {"enabled": False, "reason": "pause"})
         except Exception:
             pass
 
@@ -514,10 +530,11 @@ class LiveRunner:
         # pause stepping
         self.playing = False
         self.is_paused = True
-        # Freeze agent while paused
-        self.frozen = True
+        # Freeze agent while paused (separate from explicit user freeze).
+        self.pause_frozen = True
+        self.frozen = bool(self.pause_frozen or self.explicit_frozen)
         try:
-            self.bus.publish("AgentFreezeToggled", {"enabled": True})
+            self.bus.publish("AgentFreezeToggled", {"enabled": True, "reason": "pause"})
         except Exception:
             pass
 
@@ -529,6 +546,7 @@ class LiveRunner:
     def step_once(self):
         # single step
         try:
-            self._on_step_request({"mode": "manual"})
+            # Manual step should execute one policy action even while paused.
+            self._on_step_request({"mode": "manual", "force_agent_action": True})
         except Exception:
             raise

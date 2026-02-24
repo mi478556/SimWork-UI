@@ -33,6 +33,7 @@ from engine.oracle_tools import EnvDistanceTool
 from agent.agent_controller import AgentController
 from agent.starter_policy import StarterWanderPolicy, NoOpPolicy, OscillatingPolicy
 from agent.rl_actor_critic_policy import RLActorCriticFoodPolicy
+from agent.coda_policy import CODAPolicy
 
 from runner.live_runner import LiveRunner
 from runner.playback_runner import PlaybackRunner
@@ -46,6 +47,7 @@ from viewer.snapshot_panel import SnapshotPanel
 from viewer.live_env_panel import LiveEnvPanel
 from viewer.session_preview_panel import SessionPreviewPanel
 from viewer.rl_training_panel import RLTrainingPanel
+from viewer.coda_debug_window import CodaDebugWindow
 
 from dataset.session_store import SessionStore
 from dataset.finalize_manager import FinalizeManager
@@ -96,11 +98,16 @@ class AppController(QMainWindow):
                 "Oscillate": OscillatingPolicy(),
                 "NoOp": NoOpPolicy(),
                 "RL agent": RLActorCriticFoodPolicy(),
+                "CODA": CODAPolicy(),
             },
             active_policy_name="RL agent",
             tools={"distance": EnvDistanceTool(self.env)},
         )
         self.rl_checkpoint_path = os.path.join(data_root, "checkpoints", "rl_agent_latest.pt")
+        self.agent_checkpoint_paths = {
+            "RL agent": self.rl_checkpoint_path,
+            "CODA": os.path.join(data_root, "checkpoints", "coda_latest.npz"),
+        }
         self.rl_training_enabled = False
         self.rl_episode_count = 0
         self.rl_steps_in_episode = 0
@@ -136,6 +143,8 @@ class AppController(QMainWindow):
             store=self.store,
             bus=self.bus,
         )
+        self.coda_debug_window = CodaDebugWindow()
+        self.coda_debug_window.hide()
 
         # ------------------------------------------------------------------
         # Window + root layout
@@ -227,6 +236,11 @@ class AppController(QMainWindow):
         self.load_rl_btn = QPushButton("Load RL")
         self.load_rl_btn.clicked.connect(self._load_rl_checkpoint)
         self.toolbar.addWidget(self.load_rl_btn)
+
+        self.coda_debug_btn = QPushButton("CODA Debug")
+        self.coda_debug_btn.setCheckable(True)
+        self.coda_debug_btn.clicked.connect(self._on_toggle_coda_debug_window)
+        self.toolbar.addWidget(self.coda_debug_btn)
 
         self.play_control_btn = QPushButton("Play")
         self.play_control_btn.setCheckable(True)
@@ -384,6 +398,7 @@ class AppController(QMainWindow):
         self.sim_state = "RUNNING"
         self.control_mode = "AGENT"
         self._refresh_edit_tools_ui()
+        self._refresh_coda_debug_policy_binding()
 
         # Preview hooks
 
@@ -626,6 +641,28 @@ class AppController(QMainWindow):
             self.bus.publish("AgentPolicyChanged", {"name": name})
         except Exception:
             pass
+        self._refresh_coda_debug_policy_binding()
+
+    def _refresh_coda_debug_policy_binding(self):
+        try:
+            if self.coda_debug_window is None:
+                return
+            policy = getattr(self.agent_controller, "policy", None)
+            self.coda_debug_window.set_policy(policy)
+        except Exception:
+            pass
+
+    def _on_toggle_coda_debug_window(self, checked: bool):
+        try:
+            if checked:
+                self._refresh_coda_debug_policy_binding()
+                self.coda_debug_window.show()
+                self.coda_debug_window.raise_()
+                self.coda_debug_window.activateWindow()
+            else:
+                self.coda_debug_window.hide()
+        except Exception:
+            pass
 
     def _get_rl_policy(self):
         policy = self.agent_controller.policies.get("RL agent")
@@ -633,6 +670,18 @@ class AppController(QMainWindow):
             self._notify_user("RL agent policy is not registered.")
             return None
         return policy
+
+    def _get_selected_saveable_policy(self):
+        name = str(self.agent_controller.active_policy_name or "")
+        policy = self.agent_controller.policies.get(name)
+        if policy is None:
+            return None, None
+        if not (hasattr(policy, "save") and hasattr(policy, "load")):
+            return None, None
+        path = self.agent_checkpoint_paths.get(name)
+        if path is None:
+            return None, None
+        return policy, path
 
     def _set_agent_selector_text(self, name: str):
         try:
@@ -767,31 +816,31 @@ class AppController(QMainWindow):
         self._update_rl_training_dashboard()
 
     def _save_rl_checkpoint(self, *, auto: bool):
-        policy = self._get_rl_policy()
-        if policy is None:
+        policy, checkpoint_path = self._get_selected_saveable_policy()
+        if policy is None or checkpoint_path is None:
+            if not auto:
+                self._notify_user("Selected agent does not support save/load checkpoints.")
             return
         try:
-            policy.save(self.rl_checkpoint_path)
+            policy.save(checkpoint_path)
             if not auto:
-                self._notify_user(f"Saved RL checkpoint:\n{self.rl_checkpoint_path}")
+                self._notify_user(f"Saved checkpoint ({self.agent_controller.active_policy_name}):\n{checkpoint_path}")
             else:
                 self.rl_last_autosave_episode = int(self.rl_episode_count)
         except Exception as e:
             self._notify_user(f"Failed to save RL checkpoint:\n{e}")
 
     def _load_rl_checkpoint(self):
-        policy = self._get_rl_policy()
-        if policy is None:
+        policy, checkpoint_path = self._get_selected_saveable_policy()
+        if policy is None or checkpoint_path is None:
+            self._notify_user("Selected agent does not support save/load checkpoints.")
             return
-        if not os.path.exists(self.rl_checkpoint_path):
-            self._notify_user(f"No checkpoint found:\n{self.rl_checkpoint_path}")
+        if not os.path.exists(checkpoint_path):
+            self._notify_user(f"No checkpoint found:\n{checkpoint_path}")
             return
         try:
-            policy.load(self.rl_checkpoint_path)
-            if self.agent_controller.active_policy_name != "RL agent":
-                self.agent_controller.set_active_policy("RL agent")
-                self._set_agent_selector_text("RL agent")
-            self._notify_user(f"Loaded RL checkpoint:\n{self.rl_checkpoint_path}")
+            policy.load(checkpoint_path)
+            self._notify_user(f"Loaded checkpoint ({self.agent_controller.active_policy_name}):\n{checkpoint_path}")
             self._update_rl_training_dashboard()
         except Exception as e:
             self._notify_user(f"Failed to load RL checkpoint:\n{e}")
@@ -852,7 +901,10 @@ class AppController(QMainWindow):
             "phase1_stop_max_steps": int(self.rl_stop_reasons.get("max_steps", 0)),
             "autosave_every": f"{int(self.rl_autosave_every)} episodes",
             "last_autosave_episode": int(self.rl_last_autosave_episode),
-            "checkpoint_path": self.rl_checkpoint_path,
+            "checkpoint_path": self.agent_checkpoint_paths.get(
+                str(self.agent_controller.active_policy_name or ""),
+                self.rl_checkpoint_path,
+            ),
             "reward_history": self.rl_episode_rewards[-120:],
             "steps_history": self.rl_episode_steps_history[-120:],
         }
@@ -1267,7 +1319,28 @@ class AppController(QMainWindow):
         elif self.current_mode == "eval":
             pass
 
+        self._update_coda_debug_window()
+
         # Rendering is event-driven via EnvRenderPacket; no per-tick refresh needed
+
+    def _update_coda_debug_window(self):
+        try:
+            if self.coda_debug_window is None:
+                return
+            if not self.coda_debug_window.isVisible():
+                if hasattr(self, "coda_debug_btn") and self.coda_debug_btn.isChecked():
+                    self.coda_debug_btn.setChecked(False)
+                return
+
+            policy = getattr(self.agent_controller, "policy", None)
+            if policy is None or not hasattr(policy, "get_latest_debug_packet"):
+                return
+
+            packet = policy.get_latest_debug_packet()
+            if packet:
+                self.coda_debug_window.update_packet(packet)
+        except Exception:
+            pass
 
                                                            
     def _on_inject_request(self, payload):
@@ -1517,6 +1590,17 @@ class AppController(QMainWindow):
             return
         # Reset the authoritative runtime
         self.env.reset()
+
+        # Notify active policy so model-based buffers can break transition chains.
+        try:
+            policy = getattr(self.agent_controller, "policy", None)
+            if policy is not None:
+                if hasattr(policy, "on_environment_reset"):
+                    policy.on_environment_reset()
+                elif hasattr(policy, "reset_episode"):
+                    policy.reset_episode()
+        except Exception:
+            pass
 
         # Emit render packet so UI and panels update from authoritative state
         try:
