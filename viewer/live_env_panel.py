@@ -49,6 +49,7 @@ class LiveEnvPanel(QWidget):
         bus.subscribe("EditModeToggled", self._on_edit_mode_toggled)
 
         self.edit_mode_enabled: bool = False
+        self._drag_target: Optional[tuple[str, Optional[int]]] = None
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -118,8 +119,110 @@ class LiveEnvPanel(QWidget):
         wx = WORLD_MIN + (x / w) * (WORLD_MAX - WORLD_MIN)
         wy = WORLD_MIN + (y / h) * (WORLD_MAX - WORLD_MIN)
 
-        # publish an edit request to move the agent
-        self.bus.publish("EnvEditRequested", {"mutation": {"agent_pos": [wx, wy]}})
+        target = self._pick_drag_target(x, y)
+        if target is None:
+            self._drag_target = None
+            return
+
+        self._drag_target = target
+        self._publish_drag_edit(wx, wy)
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if not getattr(self, "edit_mode_enabled", False):
+            return
+        if self._drag_target is None:
+            return
+
+        try:
+            pos = e.position()
+            x = float(pos.x())
+            y = float(pos.y())
+        except Exception:
+            x = float(e.x())
+            y = float(e.y())
+
+        w = max(1.0, float(self.width()))
+        h = max(1.0, float(self.height()))
+        wx = WORLD_MIN + (x / w) * (WORLD_MAX - WORLD_MIN)
+        wy = WORLD_MIN + (y / h) * (WORLD_MAX - WORLD_MIN)
+        self._publish_drag_edit(wx, wy)
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_target = None
+        e.accept()
+
+    def _world_to_screen(self, wx: float, wy: float) -> tuple[float, float]:
+        w = max(1.0, float(self.width()))
+        h = max(1.0, float(self.height()))
+        sx = ((float(wx) - WORLD_MIN) / (WORLD_MAX - WORLD_MIN)) * w
+        sy = ((float(wy) - WORLD_MIN) / (WORLD_MAX - WORLD_MIN)) * h
+        return sx, sy
+
+    def _pick_drag_target(self, click_x: float, click_y: float) -> Optional[tuple[str, Optional[int]]]:
+        snap = self.snapshot
+        if snap is None:
+            return ("agent", None)
+
+        candidates: list[tuple[str, Optional[int], float]] = []
+
+        try:
+            if hasattr(snap, "get"):
+                agent = snap.get("agent_pos", [0.0, 0.0])
+                pods = snap.get("pods", []) or []
+            else:
+                agent = getattr(snap, "agent_pos", [0.0, 0.0])
+                pods = getattr(snap, "pods", []) or []
+        except Exception:
+            return ("agent", None)
+
+        try:
+            ax, ay = float(agent[0]), float(agent[1])
+            asx, asy = self._world_to_screen(ax, ay)
+            d2 = (asx - click_x) ** 2 + (asy - click_y) ** 2
+            candidates.append(("agent", None, d2))
+        except Exception:
+            pass
+
+        for idx, p in enumerate(pods):
+            try:
+                pos = p.get("pos") if hasattr(p, "get") else getattr(p, "pos")
+                px, py = float(pos[0]), float(pos[1])
+                psx, psy = self._world_to_screen(px, py)
+                d2 = (psx - click_x) ** 2 + (psy - click_y) ** 2
+                candidates.append(("pod", idx, d2))
+            except Exception:
+                continue
+
+        if not candidates:
+            return ("agent", None)
+
+        target, idx, best_d2 = min(candidates, key=lambda t: t[2])
+        max_pick_px = 22.0
+        if best_d2 > (max_pick_px * max_pick_px):
+            return None
+        return (target, idx)
+
+    def _publish_drag_edit(self, wx: float, wy: float):
+        if self._drag_target is None:
+            return
+        target, idx = self._drag_target
+        if target == "agent":
+            self.bus.publish("EnvEditRequested", {"mutation": {"agent_pos": [wx, wy]}})
+            return
+        if target == "pod" and idx is not None:
+            self.bus.publish(
+                "EnvEditRequested",
+                {
+                    "mutation": {
+                        "pod_pos": {
+                            "index": int(idx),
+                            "pos": [wx, wy],
+                        }
+                    }
+                },
+            )
 
     # ------------------------------------------------------------------
     # Rendering

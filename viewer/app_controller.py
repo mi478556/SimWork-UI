@@ -488,13 +488,8 @@ class AppController(QMainWindow):
     # Centralized control intent handlers
     # ------------------------------------------------------------
     def _on_play_requested(self, payload):
-        # Play -> running; enforce edit_mode OFF
+        # Play -> running
         self.sim_state = "RUNNING"
-        self.edit_mode = False
-        try:
-            self.edit_mode_btn.setChecked(False)
-        except Exception:
-            pass
         try:
             self.play_control_btn.setChecked(True)
             self.pause_control_btn.setChecked(False)
@@ -1633,6 +1628,27 @@ class AppController(QMainWindow):
                     else:
                         out[k] = v
                 return out
+
+            # Structured pod drag update: {"pod_pos": {"index": i, "pos": [x, y]}}
+            pod_pos_patch = mutation.get("pod_pos") if isinstance(mutation, dict) else None
+            if isinstance(pod_pos_patch, dict):
+                idx = int(pod_pos_patch.get("index", -1))
+                pos = pod_pos_patch.get("pos", None)
+                if isinstance(pos, (list, tuple)) and len(pos) == 2:
+                    pods = candidate.get("pods", []) or []
+                    if 0 <= idx < len(pods):
+                        pod = pods[idx]
+                        if isinstance(pod, dict):
+                            pod["pos"] = [float(pos[0]), float(pos[1])]
+                        else:
+                            try:
+                                pod.pos = np.array([float(pos[0]), float(pos[1])], dtype=np.float32)
+                            except Exception:
+                                pass
+                        candidate["pods"] = pods
+                # Do not pass this synthetic key into deep snapshot merge.
+                mutation = dict(mutation)
+                mutation.pop("pod_pos", None)
 
             candidate = _deep_update(candidate, mutation)
 
