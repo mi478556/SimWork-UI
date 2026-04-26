@@ -5,6 +5,8 @@
 # Data directories
 data/
 **/data/
+workdir/
+.codex
 
 # Files and folders starting with underscore
 _*

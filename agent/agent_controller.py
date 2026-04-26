@@ -23,6 +23,7 @@ class AgentController:
         self.active_policy_name: Optional[str] = None
         self.logging_agent = logging_agent
         self.tools = tools or {}
+        self._refresh_tool_refs()
 
         self.paused: bool = False
         self.policy_frozen: bool = False
@@ -47,9 +48,11 @@ class AgentController:
         if not name:
             raise ValueError("Policy name must be a non-empty string.")
         self.policies[name] = policy
+        self._refresh_tool_refs()
         if set_active or self.active_policy_name is None:
             self.active_policy_name = name
             self.policy = policy
+            self._refresh_tool_refs()
 
     def list_policies(self):
         return list(self.policies.keys())
@@ -60,7 +63,15 @@ class AgentController:
             return False
         self.active_policy_name = name
         self.policy = policy
+        self._refresh_tool_refs()
         return True
+
+    def _refresh_tool_refs(self):
+        try:
+            self.tools["policies"] = self.policies
+            self.tools["active_policy_name"] = self.active_policy_name
+        except Exception:
+            pass
 
                                                               
     def set_execution_enabled(self, flag: bool):
@@ -97,6 +108,7 @@ class AgentController:
         env_state,
         session_ids: Dict[str, str],
     ) -> Optional[Tuple[list, Optional[float]]]:
+        self._refresh_tool_refs()
 
                                                      
         if not self.execution_enabled:
@@ -135,6 +147,7 @@ class AgentController:
         )
 
     def run_step(self, observation: Observation):
+        self._refresh_tool_refs()
 
 
         if self.policy is not None:
@@ -190,6 +203,7 @@ class AgentController:
                 "Manual probe attempted while execution disabled."
             )
 
+        self._refresh_tool_refs()
         return self.logging_agent.act(
             observation=observation,
             env_state=env_state,

@@ -7,7 +7,9 @@ import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -56,14 +58,59 @@ class CodaDebugWindow(QWidget):
 
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.clicked.connect(self._apply_logging_to_policy)
+        self.action_mode_combo = QComboBox()
+        self.action_mode_combo.addItem("Wander", "wander")
+        self.action_mode_combo.addItem("Executive", "executive")
+        self.action_mode_combo.addItem("RL Agent", "rl")
+        self.action_mode_combo.addItem("Human Control", "human")
+        self.action_mode_combo.addItem("Wall->Wander, NoWall->RL", "wall_conditional")
 
         controls_layout.addWidget(self.logging_enabled_cb)
         controls_layout.addWidget(self.every_spin)
         controls_layout.addWidget(QLabel("Output Dir"))
         controls_layout.addWidget(self.out_dir_edit, stretch=1)
+        controls_layout.addWidget(QLabel("Action Mode"))
+        controls_layout.addWidget(self.action_mode_combo)
         controls_layout.addWidget(self.apply_btn)
 
         root.addWidget(controls_group)
+
+        eval_group = QGroupBox("Evaluation")
+        eval_layout = QHBoxLayout(eval_group)
+        eval_layout.setSpacing(10)
+        self.eval_samples = QSpinBox()
+        self.eval_samples.setRange(32, 50000)
+        self.eval_samples.setValue(512)
+        self.eval_samples.setPrefix("Samples ")
+        self.eval_samples.setFixedWidth(130)
+        self.eval_horizon = QSpinBox()
+        self.eval_horizon.setRange(1, 100)
+        self.eval_horizon.setValue(20)
+        self.eval_horizon.setPrefix("Horizon ")
+        self.eval_horizon.setFixedWidth(130)
+        self.tune_trials = QSpinBox()
+        self.tune_trials.setRange(1, 64)
+        self.tune_trials.setValue(8)
+        self.tune_trials.setPrefix("Trials ")
+        self.tune_trials.setFixedWidth(120)
+        self.tune_updates = QSpinBox()
+        self.tune_updates.setRange(8, 2000)
+        self.tune_updates.setValue(128)
+        self.tune_updates.setPrefix("Upd/Trial ")
+        self.tune_updates.setFixedWidth(140)
+        self.eval_btn = QPushButton("Run Eval")
+        self.eval_btn.clicked.connect(self._run_eval_inline)
+        self.tune_btn = QPushButton("Auto Tune")
+        self.tune_btn.clicked.connect(self._run_auto_tune_inline)
+        self.eval_status = QLabel("Idle")
+        eval_layout.addWidget(self.eval_samples)
+        eval_layout.addWidget(self.eval_horizon)
+        eval_layout.addWidget(self.tune_trials)
+        eval_layout.addWidget(self.tune_updates)
+        eval_layout.addWidget(self.eval_btn)
+        eval_layout.addWidget(self.tune_btn)
+        eval_layout.addWidget(self.eval_status, stretch=1)
+        root.addWidget(eval_group)
 
         # Frame panel.
         frame_group = QGroupBox("Frames")
@@ -105,9 +152,14 @@ class CodaDebugWindow(QWidget):
         self.details.setReadOnly(True)
         self.details.setPlaceholderText("CODA metrics will appear here.")
         self.details.setMinimumHeight(170)
+        self.eval_details = QPlainTextEdit()
+        self.eval_details.setReadOnly(True)
+        self.eval_details.setPlaceholderText("Evaluation results will appear here.")
+        self.eval_details.setMinimumHeight(170)
 
         data_layout.addLayout(quick_row)
         data_layout.addWidget(self.details, stretch=1)
+        data_layout.addWidget(self.eval_details, stretch=1)
         root.addWidget(data_group, stretch=3)
 
     def _setup_image_label(self, label: QLabel):
@@ -128,10 +180,23 @@ class CodaDebugWindow(QWidget):
         self.logging_enabled_cb.setEnabled(enabled)
         self.every_spin.setEnabled(enabled)
         self.out_dir_edit.setEnabled(enabled)
+        self.action_mode_combo.setEnabled(enabled)
+        self.eval_btn.setEnabled(enabled)
+        self.tune_btn.setEnabled(enabled)
+        self.eval_samples.setEnabled(enabled)
+        self.eval_horizon.setEnabled(enabled)
+        self.tune_trials.setEnabled(enabled)
+        self.tune_updates.setEnabled(enabled)
 
         if enabled:
             try:
                 self.logging_enabled_cb.setChecked(bool(getattr(policy, "debug_logging_enabled", False)))
+            except Exception:
+                pass
+            try:
+                mode = str(getattr(policy, "action_mode", "wander"))
+                idx = max(0, self.action_mode_combo.findData(mode))
+                self.action_mode_combo.setCurrentIndex(idx)
             except Exception:
                 pass
             try:
@@ -142,6 +207,8 @@ class CodaDebugWindow(QWidget):
                 self.out_dir_edit.setText(str(getattr(policy, "debug_dir", "data/coda_debug")))
             except Exception:
                 pass
+        else:
+            self.eval_status.setText("Unavailable")
 
     def _fmt(self, v: Any) -> str:
         if isinstance(v, float):
@@ -238,7 +305,59 @@ class CodaDebugWindow(QWidget):
         enabled = bool(self.logging_enabled_cb.isChecked())
         every = int(self.every_spin.value())
         out_dir = str(self.out_dir_edit.text()).strip()
+        action_mode = str(self.action_mode_combo.currentData() or "wander")
         try:
             self.policy.set_debug_logging(enabled, every=every, out_dir=out_dir)
+            if hasattr(self.policy, "set_action_mode"):
+                self.policy.set_action_mode(action_mode)
         except Exception:
             return
+
+    def _run_eval_inline(self):
+        if self.policy is None or not hasattr(self.policy, "forward_component"):
+            self.eval_status.setText("No CODA policy")
+            return
+        self.eval_btn.setEnabled(False)
+        self.tune_btn.setEnabled(False)
+        self.eval_status.setText("Running...")
+        QApplication.processEvents()
+        try:
+            from utils.coda_eval_dashboard import evaluate_policy
+
+            metrics = evaluate_policy(
+                self.policy,
+                max_samples=int(self.eval_samples.value()),
+                horizon=int(self.eval_horizon.value()),
+            )
+            self.eval_details.setPlainText(self._summary_to_text(metrics))
+            self.eval_status.setText("Done")
+        except Exception as exc:
+            self.eval_status.setText("Failed")
+            self.eval_details.setPlainText(f"Evaluation failed:\n{exc}")
+        finally:
+            self.eval_btn.setEnabled(True)
+            self.tune_btn.setEnabled(True)
+
+    def _run_auto_tune_inline(self):
+        if self.policy is None or not hasattr(self.policy, "auto_tune_forward_settings"):
+            self.eval_status.setText("Auto-tune unavailable")
+            return
+        self.eval_btn.setEnabled(False)
+        self.tune_btn.setEnabled(False)
+        self.eval_status.setText("Auto-tuning...")
+        QApplication.processEvents()
+        try:
+            res = self.policy.auto_tune_forward_settings(
+                trials=int(self.tune_trials.value()),
+                train_updates_per_trial=int(self.tune_updates.value()),
+                eval_samples=int(self.eval_samples.value()),
+                eval_horizon=int(self.eval_horizon.value()),
+            )
+            self.eval_details.setPlainText(self._summary_to_text(res if isinstance(res, dict) else {"result": str(res)}))
+            self.eval_status.setText("Auto-tune done")
+        except Exception as exc:
+            self.eval_status.setText("Auto-tune failed")
+            self.eval_details.setPlainText(f"Auto-tune failed:\n{exc}")
+        finally:
+            self.eval_btn.setEnabled(True)
+            self.tune_btn.setEnabled(True)

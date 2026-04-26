@@ -20,6 +20,8 @@ def build_observation(snapshot: Dict[str, Any], frame: np.ndarray) -> Dict[str, 
     agent_vel = np.array(_sget("agent_vel", [0.0, 0.0]), dtype=np.float32)
     pods = _sget("pods", []) or []
     wall = _sget("wall", None)
+    if wall is None:
+        wall = _sget("wall_state", None)
     rooms = _sget("rooms", []) or []
     bucket_side = _sget("bucket_side", "left")
 

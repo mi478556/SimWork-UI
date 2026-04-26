@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 import json
 import os
+import zipfile
+from datetime import datetime
+
+import numpy as np
 
 
 @dataclass
@@ -35,6 +39,8 @@ class ClipRef:
 
 class ClipIndex:
 
+    DEFAULT_CLIP_ID = "full_run"
+
     def __init__(self, root_dir: str):
         # root_dir now points to: dataset/saves/
         self.root_dir = root_dir
@@ -54,6 +60,48 @@ class ClipIndex:
         except Exception:
             return {}
 
+    def _session_npz_path(self, session_id: str) -> str:
+        return os.path.join(self.root_dir, session_id, "session.npz")
+
+    def _session_frame_count(self, session_id: str) -> int:
+        """Read frames.npy shape from session.npz without loading frame data."""
+        path = self._session_npz_path(session_id)
+        if not os.path.exists(path):
+            return 0
+
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                with zf.open("frames.npy", "r") as f:
+                    version = np.lib.format.read_magic(f)
+                    if version == (1, 0):
+                        shape, _, _ = np.lib.format.read_array_header_1_0(f)
+                    elif version in ((2, 0), (3, 0)):
+                        shape, _, _ = np.lib.format.read_array_header_2_0(f)
+                    else:
+                        return 0
+            return int(shape[0]) if shape else 0
+        except Exception:
+            return 0
+
+    def _default_clip(self, session_id: str) -> Dict[str, ClipRef]:
+        frame_count = self._session_frame_count(session_id)
+        if frame_count <= 0:
+            return {}
+
+        return {
+            self.DEFAULT_CLIP_ID: ClipRef(
+                session_id=session_id,
+                clip_id=self.DEFAULT_CLIP_ID,
+                start=0,
+                end=frame_count,
+                label="Full Run",
+                bookmarked_at=datetime.fromtimestamp(
+                    os.path.getmtime(self._session_npz_path(session_id))
+                ).strftime("%Y-%m-%d_%H-%M-%S"),
+                meta={"kind": "full_run", "generated": True},
+            )
+        }
+
     def _save_raw(self, session_id: str, data: dict):
         path = self._clip_path(session_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -69,7 +117,7 @@ class ClipIndex:
 
         # Backward compatible: old files store clips as top-level mapping
         if not raw:
-            return {}
+            return self._default_clip(session_id)
 
         clips_data = raw.get("clips") if isinstance(raw, dict) and "clips" in raw else raw
 
@@ -89,6 +137,9 @@ class ClipIndex:
             c.provenance = provenance
 
             clips[cid] = c
+
+        if not clips:
+            return self._default_clip(session_id)
 
         return clips
 

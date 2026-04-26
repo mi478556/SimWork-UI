@@ -165,21 +165,28 @@ class SessionStore:
 
         return session.frames[i]
 
+    def is_compatible_snapshot_schema(self, schema_version) -> bool:
+        compatible_versions = {
+            SNAPSHOT_SCHEMA_VERSION,
+            str(SNAPSHOT_SCHEMA_VERSION),
+            f"snapshot-v{SNAPSHOT_SCHEMA_VERSION}",
+        }
+        return schema_version in compatible_versions
+
     # ----------------------------------------------------
     # Snapshot access
     # ----------------------------------------------------
-    def get_step_snapshot(self, session_id: str, step: int) -> SnapshotState:
+    def build_step_snapshot(self, session: SessionData, step: int) -> SnapshotState:
         """
-        Return a validated SnapshotState for a given step.
+        Return a validated SnapshotState for a loaded session step.
         """
-
-        session = self.load_session(session_id, mmap=True)
         meta = session.meta
 
-        if meta.snapshot_schema_version != SNAPSHOT_SCHEMA_VERSION:
+        schema_version = meta.snapshot_schema_version
+        if not self.is_compatible_snapshot_schema(schema_version):
             raise SnapshotValidationError(
                 f"Dataset snapshot schema mismatch "
-                f"(session={meta.snapshot_schema_version}, "
+                f"(session={schema_version}, "
                 f"runtime={SNAPSHOT_SCHEMA_VERSION})"
             )
 
@@ -209,3 +216,11 @@ class SessionStore:
 
         validate_snapshot(snapshot)
         return snapshot
+
+    def get_step_snapshot(self, session_id: str, step: int) -> SnapshotState:
+        """
+        Return a validated SnapshotState for a given step.
+        """
+
+        session = self.load_session(session_id, mmap=True)
+        return self.build_step_snapshot(session, step)

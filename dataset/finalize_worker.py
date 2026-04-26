@@ -15,6 +15,7 @@ import numpy as np
 from dataset.session_store import SessionStore
 from dataset.session_types import SessionData, SessionMeta, ProvenanceMeta
 from dataset.clip_index import ClipRef
+from engine.snapshot_state import SNAPSHOT_SCHEMA_VERSION
 
 
 def _wait_for_files(pending_dir, columns, timeout=5.0):
@@ -152,7 +153,7 @@ def finalize_entrypoint(pending_dir: str, output_root: str, status_conn):
         session_meta = SessionMeta(
             session_id=session_id,
             created_at=created_at_str,
-            snapshot_schema_version="snapshot-v1",
+            snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
             fps=60,
             dt=1.0 / 60.0,
             env_version="env-v1",
@@ -210,7 +211,18 @@ def finalize_entrypoint(pending_dir: str, output_root: str, status_conn):
         # --------------------------------------------------
         # Save clip bookmarks
         # --------------------------------------------------
-        clips = store.clips.load(session_id, provenance=prov)
+        frame_count = int(arrays["frames"].shape[0])
+        clips = {
+            store.clips.DEFAULT_CLIP_ID: ClipRef(
+                session_id=session_id,
+                clip_id=store.clips.DEFAULT_CLIP_ID,
+                start=0,
+                end=frame_count,
+                label="Full Run",
+                bookmarked_at=created_at_str,
+                meta={"kind": "full_run", "generated": False},
+            )
+        }
         for c in meta.get("bookmarks", []):
             clips[c["clip_id"]] = ClipRef(**c)
         store.clips.save(session_id, clips)

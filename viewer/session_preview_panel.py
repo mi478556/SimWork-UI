@@ -150,7 +150,7 @@ class SessionPreviewPanel(QWidget):
 
         self.left_btn = QPushButton("◀")
         self.right_btn = QPushButton("▶")
-        self.activate_btn = QPushButton("Load")
+        self.activate_btn = QPushButton("Play Run")
         self.set_thumb_btn = QPushButton("Set Thumbnail")
 
         self.left_btn.clicked.connect(self._step_left)
@@ -176,7 +176,6 @@ class SessionPreviewPanel(QWidget):
     def refresh(self):
         try:
             self.sessions = sorted(self.store.list_sessions())
-            print(f"SessionPreviewPanel: found {len(self.sessions)} sessions")
         except Exception:
             self.sessions = []
             raise

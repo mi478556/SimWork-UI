@@ -5,6 +5,7 @@ import sys
 import os
 import time
 import inspect
+import threading
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -18,8 +19,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QStackedWidget,
+    QLabel,
 )
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QEvent
 
 import qdarkstyle
 from typing import Dict, Any
@@ -48,15 +50,24 @@ from viewer.live_env_panel import LiveEnvPanel
 from viewer.session_preview_panel import SessionPreviewPanel
 from viewer.rl_training_panel import RLTrainingPanel
 from viewer.coda_debug_window import CodaDebugWindow
+from viewer.coda_training_panel import CodaTrainingPanel
 
 from dataset.session_store import SessionStore
 from dataset.finalize_manager import FinalizeManager
+from utils.coda_saved_run_compare import (
+    apply_cfg_overrides as apply_coda_cfg_overrides,
+    candidate_specs as coda_candidate_specs,
+    compare_on_saved_run as compare_coda_on_saved_run,
+    default_cpu_threads as default_coda_cpu_threads,
+)
 
 
 class AppController(QMainWindow):
 
     submit_finalize_job = pyqtSignal(object)
     take_captured_qt = pyqtSignal(dict)
+    coda_compare_finished_qt = pyqtSignal(dict)
+    coda_compare_failed_qt = pyqtSignal(str)
 
     # Recording intent constants
     REC_OFF = "OFF"
@@ -91,6 +102,8 @@ class AppController(QMainWindow):
 
         # Ensure TakeCaptured events from EventBus are marshalled onto Qt thread
         self.take_captured_qt.connect(self._on_take_captured_qt)
+        self.coda_compare_finished_qt.connect(self._on_coda_compare_finished)
+        self.coda_compare_failed_qt.connect(self._on_coda_compare_failed)
 
         self.agent_controller = AgentController(
             policies={
@@ -98,7 +111,7 @@ class AppController(QMainWindow):
                 "Oscillate": OscillatingPolicy(),
                 "NoOp": NoOpPolicy(),
                 "RL agent": RLActorCriticFoodPolicy(),
-                "CODA": CODAPolicy(),
+                "CODA": CODAPolicy(forward_num_condition_slots=2, action_mode="executive"),
             },
             active_policy_name="RL agent",
             tools={"distance": EnvDistanceTool(self.env)},
@@ -130,6 +143,11 @@ class AppController(QMainWindow):
             store=self.store,
             bus=self.bus,
         )
+        # Expose human controller to policies (e.g., CODA human action-mode in debug).
+        try:
+            self.agent_controller.tools["human_controller"] = self.live_runner.human_controller
+        except Exception:
+            pass
 
         self.playback_runner = PlaybackRunner(
             store=self.store,
@@ -175,7 +193,7 @@ class AppController(QMainWindow):
         self.toolbar.addWidget(self.eval_btn)
 
         self.live_btn.clicked.connect(lambda: self._switch_mode("live"))
-        self.play_btn.clicked.connect(lambda: self._switch_mode("playback"))
+        self.play_btn.clicked.connect(self._on_playback_mode_button)
         self.eval_btn.clicked.connect(lambda: self._switch_mode("eval"))
 
         self.record_btn = QPushButton("Record")
@@ -242,6 +260,10 @@ class AppController(QMainWindow):
         self.coda_debug_btn.clicked.connect(self._on_toggle_coda_debug_window)
         self.toolbar.addWidget(self.coda_debug_btn)
 
+        self.coda_train_btn = QPushButton("Train CODA")
+        self.coda_train_btn.clicked.connect(self._on_open_coda_training_view)
+        self.toolbar.addWidget(self.coda_train_btn)
+
         self.play_control_btn = QPushButton("Play")
         self.play_control_btn.setCheckable(True)
         self.pause_control_btn = QPushButton("Pause")
@@ -257,22 +279,70 @@ class AppController(QMainWindow):
         self.play_control_btn.clicked.connect(lambda: self.bus.publish("PlayRequested", {}))
         self.pause_control_btn.clicked.connect(lambda: self.bus.publish("PauseRequested", {}))
         self.step_control_btn.clicked.connect(
-            lambda: self.bus.publish("LiveStep", {})
+            lambda: self.bus.publish("StepRequested", {})
         )
 
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setMinimum(1)
         self.speed_slider.setMaximum(8)
         self.speed_slider.setValue(1)
+        self.speed_slider.setMinimumWidth(260)
+        self.speed_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 8px;
+                border-radius: 4px;
+                background: #4b5563;
+            }
+            QSlider::sub-page:horizontal {
+                border-radius: 4px;
+                background: #7dd3fc;
+            }
+            QSlider::add-page:horizontal {
+                border-radius: 4px;
+                background: #4b5563;
+            }
+            QSlider::handle:horizontal {
+                width: 18px;
+                margin: -6px 0;
+                border-radius: 8px;
+                background: #f8fafc;
+                border: 1px solid #111827;
+            }
+            QSlider::handle:horizontal:hover,
+            QSlider::handle:horizontal:pressed {
+                background: #ffffff;
+                border: 1px solid #0f172a;
+            }
+            QSlider::groove:horizontal:disabled,
+            QSlider::add-page:horizontal:disabled {
+                background: #2f3540;
+            }
+            QSlider::sub-page:horizontal:disabled {
+                background: #475569;
+            }
+            QSlider::handle:horizontal:disabled {
+                background: #94a3b8;
+                border: 1px solid #1f2937;
+            }
+        """)
 
-        self.toolbar.addWidget(self.speed_slider)
+        self.transport_label = QLabel("Frame - / -")
+        self.transport_label.setMinimumWidth(110)
+        self.transport_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.transport_label.setStyleSheet("QLabel { color: #f8fafc; padding: 0 6px; }")
 
-        self.speed_slider.valueChanged.connect(
-            lambda v: self.bus.publish(
-                "LiveSpeedChanged",
-                {"factor": v}
-            )
-        )
+        self.speed_slider.valueChanged.connect(self._on_transport_slider_changed)
+        self.transport_hide_timer = QTimer(self)
+        self.transport_hide_timer.setSingleShot(True)
+        self.transport_hide_timer.setInterval(2_000)
+        self.transport_hide_timer.timeout.connect(self._hide_playback_transport_after_idle)
+        self.transport_hide_delay_sec = 2.0
+        self.transport_hide_deadline = None
+        try:
+            self.installEventFilter(self)
+            self.setMouseTracking(True)
+        except Exception:
+            pass
 
         # ------------------------------------------------------------------
         # TOP ROW: Trace browser | Trace player | Snapshot panel
@@ -307,13 +377,50 @@ class AppController(QMainWindow):
         self.rl_training_panel = RLTrainingPanel()
         self.rl_training_panel.set_max_episode_steps(self.rl_max_episode_steps)
         self.rl_training_panel.max_steps_spin.valueChanged.connect(self._on_rl_max_steps_changed)
+        self.coda_training_panel = CodaTrainingPanel()
+        try:
+            self.coda_training_panel.cpu_threads_spin.setValue(int(default_coda_cpu_threads()))
+        except Exception:
+            pass
+        self.coda_training_panel.run_compare_requested.connect(self._on_coda_compare_requested)
+        self.coda_training_panel.apply_candidate_requested.connect(self._on_coda_apply_candidate_requested)
 
         self.viewport.addWidget(self.live_env_panel)        # index 0
         self.viewport.addWidget(self.session_preview_panel) # index 1
         self.viewport.addWidget(self.rl_training_panel)     # index 2
+        self.viewport.addWidget(self.coda_training_panel)   # index 3
 
         self.viewport.setCurrentWidget(self.live_env_panel)
-
+        self.transport_container = QWidget(self.live_env_panel)
+        self.transport_container.setObjectName("playbackTransport")
+        self.transport_container.setStyleSheet("""
+            QWidget#playbackTransport {
+                background: rgba(15, 23, 42, 210);
+                border: 1px solid rgba(148, 163, 184, 160);
+                border-radius: 8px;
+            }
+        """)
+        transport_layout = QHBoxLayout(self.transport_container)
+        transport_layout.setContentsMargins(10, 8, 10, 8)
+        transport_layout.setSpacing(10)
+        transport_layout.addWidget(self.transport_label)
+        transport_layout.addWidget(self.speed_slider, stretch=1)
+        self.transport_container.hide()
+        for w in (
+            self.toolbar,
+            self.transport_container,
+            self.transport_label,
+            self.speed_slider,
+            self.live_env_panel,
+            self.play_control_btn,
+            self.pause_control_btn,
+            self.step_control_btn,
+        ):
+            try:
+                w.installEventFilter(self)
+                w.setMouseTracking(True)
+            except Exception:
+                pass
         # ------------------------------------------------------------------
         # State + subscriptions
         # ------------------------------------------------------------------
@@ -332,6 +439,7 @@ class AppController(QMainWindow):
         self.bus.subscribe("PlaybackSeekStep", self._on_playback_seek)
         self.bus.subscribe("PlaybackPlay", lambda _: self.playback_runner.play())
         self.bus.subscribe("PlaybackPause", lambda _: self.playback_runner.pause())
+        self.bus.subscribe("TraceCursorMoved", self._on_trace_cursor_moved)
 
         self.bus.subscribe("SnapshotEdited", self._on_snapshot_edited)
         self.bus.subscribe("EvalRunRequested", self._on_eval_run)
@@ -360,6 +468,7 @@ class AppController(QMainWindow):
         # Centralized control intents
         self.bus.subscribe("PlayRequested", self._on_play_requested)
         self.bus.subscribe("PauseRequested", self._on_pause_requested)
+        self.bus.subscribe("StepRequested", self._on_step_requested)
         self.bus.subscribe("EditModeRequested", self._on_edit_mode_requested)
         self.bus.subscribe("HumanModeRequested", self._on_human_mode_requested)
         self.bus.subscribe("AgentPolicyRequested", self._on_agent_policy_requested)
@@ -399,6 +508,9 @@ class AppController(QMainWindow):
         self.control_mode = "AGENT"
         self._refresh_edit_tools_ui()
         self._refresh_coda_debug_policy_binding()
+        self.current_trace_cursor = None
+        self.coda_compare_busy = False
+        self._coda_candidate_map = {row["label"]: dict(row["cfg_updates"]) for row in coda_candidate_specs()}
 
         # Preview hooks
 
@@ -438,6 +550,7 @@ class AppController(QMainWindow):
     def _switch_mode(self, mode: str):
         # Ensure any active capture stops when leaving live mode
         if self.current_mode == "live" and mode != "live":
+            self._pause_live_runtime_for_mode_switch()
             try:
                 if self.record_intent == self.REC_CAPTURING:
                     self.bus.publish("CaptureStopRequested", {})
@@ -466,6 +579,7 @@ class AppController(QMainWindow):
                 self.live_env_panel.setFocus()
             except Exception:
                 pass
+        self._refresh_transport_slider()
 
     def _on_mode_changed(self, payload):
         mode = payload["mode"]
@@ -484,6 +598,7 @@ class AppController(QMainWindow):
 
         # Leaving live mode must always stop capture immediately
         if mode != "live":
+            self._pause_live_runtime_for_mode_switch()
             if getattr(self, "rl_training_enabled", False):
                 self._set_rl_training(False)
             try:
@@ -498,11 +613,314 @@ class AppController(QMainWindow):
                 pass
 
         self._refresh_edit_tools_ui()
+        self._refresh_transport_slider()
+
+    def _pause_live_runtime_for_mode_switch(self):
+        self.sim_state = "PAUSED"
+        try:
+            self.live_runner.pause()
+        except Exception:
+            pass
+        try:
+            self.bus.publish("LivePause", {})
+        except Exception:
+            pass
+        try:
+            self.play_control_btn.setChecked(False)
+            self.pause_control_btn.setChecked(True)
+        except Exception:
+            pass
+
+    def _set_transport_slider(self, *, minimum: int, maximum: int, value: int, enabled: bool = True):
+        try:
+            self.speed_slider.blockSignals(True)
+            self.speed_slider.setMinimum(int(minimum))
+            self.speed_slider.setMaximum(int(maximum))
+            self.speed_slider.setValue(int(max(minimum, min(value, maximum))))
+            self.speed_slider.setEnabled(bool(enabled))
+        except Exception:
+            pass
+        finally:
+            try:
+                self.speed_slider.blockSignals(False)
+            except Exception:
+                pass
+
+    def _set_transport_visible(self, visible: bool):
+        try:
+            self.transport_container.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def _is_playback_transport_pinned_visible(self) -> bool:
+        if getattr(self, "current_mode", "live") != "playback":
+            return False
+        try:
+            if any(
+                w.underMouse()
+                for w in (
+                    self.transport_container,
+                    self.transport_label,
+                    self.speed_slider,
+                )
+            ):
+                return True
+        except Exception:
+            pass
+        if self.transport_container.isVisible() and self.transport_container.hasFocus():
+            return True
+        return not bool(getattr(self.playback_runner, "playing", False))
+
+    def _position_transport_overlay(self):
+        try:
+            host = self.live_env_panel
+            container = self.transport_container
+            max_w = max(320, int(host.width()) - 40)
+            target_w = min(max_w, 620)
+            target_h = max(int(container.sizeHint().height()), 44)
+            x = max(12, (int(host.width()) - target_w) // 2)
+            y = max(12, int(host.height()) - target_h - 18)
+            container.setGeometry(x, y, target_w, target_h)
+            container.raise_()
+        except Exception:
+            pass
+
+    def _is_in_transport_activation_zone(self, event) -> bool:
+        try:
+            if getattr(self, "current_mode", "live") != "playback":
+                return False
+            host = self.live_env_panel
+            self._position_transport_overlay()
+            rect = self.transport_container.geometry().adjusted(-24, -20, 24, 20)
+            if hasattr(event, "position"):
+                pos = event.position()
+                x = int(pos.x())
+                y = int(pos.y())
+            else:
+                x = int(event.x())
+                y = int(event.y())
+            return rect.contains(x, y)
+        except Exception:
+            return False
+
+    def eventFilter(self, obj, event):
+        try:
+            etype = event.type()
+            if obj in (
+                self.toolbar,
+                self.transport_container,
+                self.transport_label,
+                self.speed_slider,
+                self.play_control_btn,
+                self.pause_control_btn,
+                self.step_control_btn,
+            ):
+                if etype in (
+                    QEvent.Type.Enter,
+                    QEvent.Type.MouseMove,
+                    QEvent.Type.FocusIn,
+                    QEvent.Type.MouseButtonPress,
+                ):
+                    self._show_playback_transport_for_interaction()
+                elif etype == QEvent.Type.Leave:
+                    self._schedule_playback_transport_hide()
+            elif obj is self.live_env_panel:
+                if etype == QEvent.Type.Resize:
+                    self._position_transport_overlay()
+                elif etype in (
+                    QEvent.Type.Enter,
+                    QEvent.Type.MouseMove,
+                    QEvent.Type.MouseButtonPress,
+                    QEvent.Type.FocusIn,
+                ):
+                    if etype == QEvent.Type.FocusIn:
+                        self._show_playback_transport_for_interaction()
+                    elif self.transport_container.isVisible() or self._is_in_transport_activation_zone(event):
+                        self._show_playback_transport_for_interaction()
+                    else:
+                        self._schedule_playback_transport_hide()
+                elif etype == QEvent.Type.Leave:
+                    self._schedule_playback_transport_hide()
+            elif obj is self and etype in (
+                QEvent.Type.Leave,
+                QEvent.Type.WindowDeactivate,
+            ):
+                self._schedule_playback_transport_hide()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def enterEvent(self, event):
+        return super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._schedule_playback_transport_hide()
+        return super().leaveEvent(event)
+
+    def _show_playback_transport_for_interaction(self):
+        if getattr(self, "current_mode", "live") != "playback":
+            return
+        try:
+            self.transport_hide_timer.stop()
+        except Exception:
+            pass
+        self.transport_hide_deadline = None
+        self._position_transport_overlay()
+        self._set_transport_visible(True)
+        if not self._is_playback_transport_pinned_visible():
+            self._schedule_playback_transport_hide()
+
+    def _schedule_playback_transport_hide(self):
+        if getattr(self, "current_mode", "live") != "playback":
+            return
+        if self._is_playback_transport_pinned_visible():
+            try:
+                self.transport_hide_timer.stop()
+            except Exception:
+                pass
+            self.transport_hide_deadline = None
+            self._set_transport_visible(True)
+            return
+        self.transport_hide_deadline = time.monotonic() + float(self.transport_hide_delay_sec)
+        try:
+            self.transport_hide_timer.start(int(float(self.transport_hide_delay_sec) * 1000))
+        except Exception:
+            pass
+
+    def _hide_playback_transport_after_idle(self):
+        if getattr(self, "current_mode", "live") != "playback":
+            return
+        if self._is_playback_transport_pinned_visible():
+            self.transport_hide_deadline = None
+            self._set_transport_visible(True)
+            return
+        deadline = getattr(self, "transport_hide_deadline", None)
+        if deadline is None:
+            return
+        remaining = float(deadline) - time.monotonic()
+        if remaining > 0.0:
+            try:
+                self.transport_hide_timer.start(max(1, int(remaining * 1000)))
+            except Exception:
+                pass
+            return
+        self.transport_hide_deadline = None
+        self._set_transport_visible(False)
+
+    def _update_transport_label(self):
+        if getattr(self, "current_mode", "live") != "playback":
+            try:
+                self.transport_label.setText("Frame - / -")
+            except Exception:
+                pass
+            return
+
+        start = int(getattr(self.playback_runner, "_clip_start", 0))
+        end = int(getattr(self.playback_runner, "_clip_end", 0))
+        cursor = int(getattr(self.playback_runner, "_cursor", start))
+        total = max(0, end - start)
+        if total <= 0:
+            text = "Frame - / -"
+        else:
+            current = max(0, min(cursor - start, total - 1)) + 1
+            text = f"Frame {current} / {total}"
+        try:
+            self.transport_label.setText(text)
+        except Exception:
+            pass
+
+    def _sync_playback_transport_buttons(self):
+        if getattr(self, "current_mode", "live") != "playback":
+            return
+
+        playing = bool(getattr(self.playback_runner, "playing", False))
+        try:
+            self.play_control_btn.setChecked(playing)
+            self.pause_control_btn.setChecked(not playing)
+        except Exception:
+            pass
+        self._update_transport_label()
+
+    def _refresh_transport_slider(self):
+        if getattr(self, "current_mode", "live") == "playback":
+            start = int(getattr(self.playback_runner, "_clip_start", 0))
+            end = int(getattr(self.playback_runner, "_clip_end", 0))
+            cursor = int(getattr(self.playback_runner, "_cursor", start))
+            if end > start:
+                self._set_transport_slider(
+                    minimum=0,
+                    maximum=(end - start) - 1,
+                    value=cursor - start,
+                    enabled=True,
+                )
+            else:
+                self._set_transport_slider(minimum=0, maximum=0, value=0, enabled=False)
+            self._update_transport_label()
+            if self._is_playback_transport_pinned_visible():
+                self._show_playback_transport_for_interaction()
+            return
+
+        self._set_transport_visible(False)
+        try:
+            self.transport_hide_timer.stop()
+        except Exception:
+            pass
+        self.transport_hide_deadline = None
+        self._set_transport_slider(minimum=0, maximum=0, value=0, enabled=False)
+        self._update_transport_label()
+
+    def _on_transport_slider_changed(self, value: int):
+        if getattr(self, "current_mode", "live") == "playback":
+            self._show_playback_transport_for_interaction()
+            self._schedule_playback_transport_hide()
+            start = int(getattr(self.playback_runner, "_clip_start", 0))
+            self.bus.publish("PlaybackSeekStep", {"step": start + int(value)})
+            self._sync_playback_transport_buttons()
+            return
+
+    def _on_trace_cursor_moved(self, payload):
+        try:
+            self.current_trace_cursor = dict(payload or {})
+            self.coda_training_panel.set_source(
+                session_id=self.current_trace_cursor.get("session_id"),
+                clip_id=self.current_trace_cursor.get("clip_id"),
+                step_index=self.current_trace_cursor.get("step_index"),
+            )
+        except Exception:
+            pass
+        if getattr(self, "current_mode", "live") != "playback":
+            return
+        step = int(payload.get("step_index", 0))
+        start = int(getattr(self.playback_runner, "_clip_start", 0))
+        relative_step = max(0, step - start)
+        try:
+            self.speed_slider.blockSignals(True)
+            if self.speed_slider.minimum() <= relative_step <= self.speed_slider.maximum():
+                self.speed_slider.setValue(relative_step)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.speed_slider.blockSignals(False)
+            except Exception:
+                pass
+        self._update_transport_label()
 
     # ------------------------------------------------------------
     # Centralized control intent handlers
     # ------------------------------------------------------------
     def _on_play_requested(self, payload):
+        if self.current_mode == "playback":
+            try:
+                self.play_control_btn.setChecked(True)
+                self.pause_control_btn.setChecked(False)
+            except Exception:
+                pass
+            self.bus.publish("PlaybackPlay", {})
+            self._show_playback_transport_for_interaction()
+            self._sync_playback_transport_buttons()
+            return
+
         # Play -> running
         self.sim_state = "RUNNING"
         try:
@@ -545,6 +963,17 @@ class AppController(QMainWindow):
                 pass
 
     def _on_pause_requested(self, payload):
+        if self.current_mode == "playback":
+            try:
+                self.play_control_btn.setChecked(False)
+                self.pause_control_btn.setChecked(True)
+            except Exception:
+                pass
+            self.bus.publish("PlaybackPause", {})
+            self._show_playback_transport_for_interaction()
+            self._sync_playback_transport_buttons()
+            return
+
         self.sim_state = "PAUSED"
         try:
             self.play_control_btn.setChecked(False)
@@ -559,6 +988,17 @@ class AppController(QMainWindow):
             self.rl_training_panel.set_graphs_paused(True)
         except Exception:
             pass
+
+    def _on_step_requested(self, payload):
+        if self.current_mode == "playback":
+            try:
+                self.playback_runner.step_once()
+            except Exception:
+                pass
+            self._sync_playback_transport_buttons()
+            return
+
+        self.bus.publish("LiveStep", {})
 
     def _on_edit_mode_requested(self, payload):
         enabled = bool(payload.get("enabled", False))
@@ -649,11 +1089,16 @@ class AppController(QMainWindow):
                 return
             policy = getattr(self.agent_controller, "policy", None)
             self.coda_debug_window.set_policy(policy)
+            if policy is not None and hasattr(policy, "set_debug_view_enabled"):
+                policy.set_debug_view_enabled(bool(self.coda_debug_window.isVisible()))
         except Exception:
             pass
 
     def _on_toggle_coda_debug_window(self, checked: bool):
         try:
+            policy = getattr(self.agent_controller, "policy", None)
+            if policy is not None and hasattr(policy, "set_debug_view_enabled"):
+                policy.set_debug_view_enabled(bool(checked))
             if checked:
                 self._refresh_coda_debug_policy_binding()
                 self.coda_debug_window.show()
@@ -844,6 +1289,82 @@ class AppController(QMainWindow):
             self._update_rl_training_dashboard()
         except Exception as e:
             self._notify_user(f"Failed to load RL checkpoint:\n{e}")
+
+    def _on_open_coda_training_view(self):
+        if self.current_mode != "playback":
+            self._switch_mode("playback")
+        self._show_coda_training_view()
+
+    def _on_coda_compare_requested(self, payload: Dict[str, Any]):
+        session_id = str(payload.get("session_id", "")).strip()
+        if not session_id:
+            self._notify_user("Select a saved playback session first.")
+            return
+        if self.coda_compare_busy:
+            self._notify_user("CODA compare is already running.")
+            return
+
+        self.coda_compare_busy = True
+        try:
+            self.coda_training_panel.set_running(True, f"Running CODA compare on {session_id} ...")
+        except Exception:
+            pass
+
+        def _job():
+            try:
+                rows = compare_coda_on_saved_run(
+                    data_root=self.store.root_dir,
+                    session_id=session_id,
+                    offline_updates=int(payload.get("offline_updates", 64)),
+                    eval_samples=int(payload.get("eval_samples", 192)),
+                    candidates=list(payload.get("candidates") or []),
+                    cpu_threads=int(payload.get("cpu_threads", default_coda_cpu_threads())),
+                )
+                self.coda_compare_finished_qt.emit({"session_id": session_id, "rows": rows})
+            except Exception as e:
+                self.coda_compare_failed_qt.emit(str(e))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_coda_compare_finished(self, payload: Dict[str, Any]):
+        self.coda_compare_busy = False
+        rows = list(payload.get("rows") or [])
+        try:
+            self.coda_training_panel.set_running(False, f"Compare finished for {payload.get('session_id', '-')}")
+            self.coda_training_panel.set_results(rows)
+        except Exception:
+            pass
+
+    def _on_coda_compare_failed(self, message: str):
+        self.coda_compare_busy = False
+        try:
+            self.coda_training_panel.set_running(False, "Compare failed")
+        except Exception:
+            pass
+        self._notify_user(f"CODA compare failed:\n{message}")
+
+    def _on_coda_apply_candidate_requested(self, payload: Dict[str, Any]):
+        label = str(payload.get("label", "")).strip()
+        cfg_updates = payload.get("cfg_updates")
+        if cfg_updates is None:
+            cfg_updates = self._coda_candidate_map.get(label)
+        if not isinstance(cfg_updates, dict):
+            self._notify_user(f"Unknown CODA preset: {label or 'unknown'}")
+            return
+        policy = self.agent_controller.policies.get("CODA")
+        if policy is None:
+            self._notify_user("CODA policy is not registered.")
+            return
+        try:
+            apply_coda_cfg_overrides(policy, dict(cfg_updates))
+            if self.agent_controller.active_policy_name == "CODA":
+                self._refresh_coda_debug_policy_binding()
+            try:
+                self.coda_training_panel.set_status_text(f"Applied CODA preset: {label}")
+            except Exception:
+                pass
+        except Exception as e:
+            self._notify_user(f"Failed to apply CODA preset:\n{e}")
 
     def _update_rl_training_dashboard(self):
         policy = self._get_rl_policy()
@@ -1213,9 +1734,56 @@ class AppController(QMainWindow):
         except Exception:
             pass
 
+    def _has_loaded_playback_clip(self) -> bool:
+        return bool(
+            getattr(self.playback_runner, "_session_id", None)
+            and getattr(self.playback_runner, "_clip_id", None)
+        )
+
+    def _show_loaded_playback_clip(self):
+        try:
+            self.viewport.setCurrentWidget(self.live_env_panel)
+            self.live_env_panel.setFocus()
+        except Exception:
+            pass
+        try:
+            cursor = int(getattr(self.playback_runner, "_cursor", 0))
+            self.playback_runner.seek_step(cursor)
+        except Exception:
+            pass
+        self._refresh_transport_slider()
+        self._sync_playback_transport_buttons()
+
+    def _on_playback_mode_button(self):
+        if self.current_mode != "playback":
+            self._switch_mode("playback")
+            return
+
+        try:
+            current = self.viewport.currentWidget()
+        except Exception:
+            current = None
+
+        if current is self.session_preview_panel and self._has_loaded_playback_clip():
+            self._show_loaded_playback_clip()
+            return
+
+        try:
+            self.bus.publish("PlaybackPause", {})
+        except Exception:
+            pass
+        self._sync_playback_transport_buttons()
+        self._show_session_preview()
+
     def _show_rl_training_view(self):
         try:
             self.viewport.setCurrentWidget(self.rl_training_panel)
+        except Exception:
+            pass
+
+    def _show_coda_training_view(self):
+        try:
+            self.viewport.setCurrentWidget(self.coda_training_panel)
         except Exception:
             pass
 
@@ -1239,6 +1807,7 @@ class AppController(QMainWindow):
                 {
                     "session_id": sid,
                     "clip_id": clip_id,
+                    "auto_play": True,
                 },
             )
         except Exception:
@@ -1315,6 +1884,7 @@ class AppController(QMainWindow):
                         
                                                                                
             self.playback_runner.tick()
+            self._sync_playback_transport_buttons()
 
         elif self.current_mode == "eval":
             pass
@@ -1426,15 +1996,30 @@ class AppController(QMainWindow):
 
                                                            
     def _on_playback_select(self, payload):
-        print(f"[AppController] _on_playback_select: session={payload.get('session_id')} clip={payload.get('clip_id')}")
         self.playback_runner.load_clip(
             payload["session_id"],
             payload["clip_id"]
         )
+        self._refresh_transport_slider()
+        try:
+            self.viewport.setCurrentWidget(self.live_env_panel)
+            self.live_env_panel.setFocus()
+        except Exception:
+            pass
+        if bool(payload.get("auto_play", False)):
+            try:
+                self.play_control_btn.setChecked(True)
+                self.pause_control_btn.setChecked(False)
+            except Exception:
+                pass
+            self.bus.publish("PlaybackPlay", {})
+            self._show_playback_transport_for_interaction()
+        self._sync_playback_transport_buttons()
 
     def _on_playback_seek(self, payload):
                                                
         self.playback_runner.seek_step(payload["step"])
+        self._sync_playback_transport_buttons()
 
                                                            
     def _on_eval_run(self, payload):
